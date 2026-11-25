@@ -32,7 +32,7 @@ test("filter fingerprint change resets pagination, expansion and snapshots but k
     { type: "groupLoadStarted", key: "7", page: 1, pageSize: 10 },
     { type: "assetScopeSelected", scope: "host:a" },
     { type: "rowExpanded", key: "finding:1", edit },
-    { type: "filterFingerprintChanged" },
+    { type: "filterFingerprintChanged", fingerprint: "new" },
   ]);
   assert.equal(s.groupPagination.page, 1);
   assert.equal(s.grouped.expanded.size, 0);
@@ -125,4 +125,28 @@ test("editChanged accepts values and functional updates", () => {
   assert.equal(collapsed.expandedRow.key, null);
   assert.equal(collapsed.expandedRow.edit, null);
   assert.equal(findingsPageReducer(collapsed, { type: "editChanged", edit: (e) => e }), collapsed);
+});
+
+test("the same fingerprint again is a no-op, so the render-time check settles", () => {
+  const s = reduce([
+    { type: "filterFingerprintChanged", fingerprint: "a" },
+    { type: "pagination/pageChanged", page: 3 },
+  ]);
+  assert.equal(findingsPageReducer(s, { type: "filterFingerprintChanged", fingerprint: "a" }), s);
+});
+
+test("picking another asset node goes back to page one in the same update", () => {
+  const s = reduce([
+    { type: "pagination/pageChanged", page: 3 },
+    { type: "assetScopeSelected", scope: "host:a" },
+  ]);
+  assert.equal(s.pagination.page, 1);
+  assert.equal(s.asset.scope, "host:a");
+});
+
+test("picking another asset node supersedes a load still in flight but keeps the rows on screen", () => {
+  const loading = reduce([{ type: "list/loaded", items: [{ id: 1 }], total: 1 }, { type: "list/loadStarted" }]);
+  const s = findingsPageReducer(loading, { type: "assetScopeSelected", scope: "host:b" });
+  assert.equal(s.flat.loading, false);
+  assert.deepEqual(s.flat.items, [{ id: 1 }]);
 });

@@ -158,6 +158,8 @@ export type FindingsPageState = {
   view: FindingView;
   /** False until saved list preferences have been read from localStorage. */
   preferencesHydrated: boolean;
+  /** The filter + company fingerprint the current pages, snapshots and expansion belong to. */
+  appliedFilterFingerprint: string;
   filters: FindingsFilters;
   flat: ListState<Finding>;
   /** The flat (and asset) view's pager; one-based pages. */
@@ -191,7 +193,7 @@ export type FindingsPageAction =
   | { type: "preferencesRestored"; view?: FindingView; filters: Partial<FindingListPreferences> }
   | { type: "filterChanged"; patch: Partial<FindingsFilters> }
   | { type: "searchDebounced" }
-  | { type: "filterFingerprintChanged" }
+  | { type: "filterFingerprintChanged"; fingerprint: string }
   | { type: "assetScopeSelected"; scope: string | null }
   | { type: "assetTreeLoadStarted" }
   | {
@@ -232,6 +234,7 @@ export function createInitialFindingsPageState(): FindingsPageState {
   return {
     view: "flat",
     preferencesHydrated: false,
+    appliedFilterFingerprint: "",
     filters: {
       severity: "all",
       status: "all",
@@ -302,8 +305,10 @@ export function findingsPageReducer(state: FindingsPageState, action: FindingsPa
     // Reset every view's pagination and expansion when a shared finding filter changes. The
     // previously selected asset node may no longer be in the tree, so fall back to "All assets".
     case "filterFingerprintChanged":
+      if (action.fingerprint === state.appliedFilterFingerprint) return state;
       return {
         ...state,
+        appliedFilterFingerprint: action.fingerprint,
         flat: EMPTY_FLAT_STATE,
         pagination: toFirstPage(state.pagination),
         asset: { tree: EMPTY_ASSET_TREE, scope: null },
@@ -313,7 +318,14 @@ export function findingsPageReducer(state: FindingsPageState, action: FindingsPa
       };
     case "assetScopeSelected":
       if (action.scope === state.asset.scope) return state;
-      return { ...state, asset: { ...state.asset, scope: action.scope } };
+      // A different asset node is a different result set: back to page one in the same update, and a
+      // load still in flight for the old node no longer counts, so the next refresh reloads right away.
+      return {
+        ...state,
+        asset: { ...state.asset, scope: action.scope },
+        pagination: toFirstPage(state.pagination),
+        flat: state.flat.loading ? { ...state.flat, loading: false } : state.flat,
+      };
     case "assetTreeLoadStarted":
       return { ...state, asset: { ...state.asset, tree: { ...state.asset.tree, loading: true } } };
     case "assetTreeLoaded":

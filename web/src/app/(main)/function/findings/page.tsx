@@ -129,6 +129,13 @@ export default function FindingsPage() {
   ]);
   const activeFilterFingerprint = React.useRef(filterFingerprint);
   activeFilterFingerprint.current = filterFingerprint;
+  // Reset every view's pagination, expansion and snapshots as soon as a shared filter or the company
+  // changes. This runs during render rather than in an effect, so the polling effect never fetches the
+  // previous page number with the new filters. The reset also drops the picked asset node, which may
+  // not exist under the new filters or company.
+  if (state.appliedFilterFingerprint !== filterFingerprint) {
+    dispatch({ type: "filterFingerprintChanged", fingerprint: filterFingerprint });
+  }
 
   // One lightweight request covers all rows/views, avoiding per-row fetches of full retest history; wait for the previous round to finish before polling again.
   React.useEffect(() => {
@@ -275,14 +282,6 @@ export default function FindingsPage() {
   expandedGroupsRef.current = expandedGroups;
   groupFindingsRef.current = groupFindings;
   visibleGroupKeysRef.current = new Set(groups.map(findingGroupKey));
-
-  // A company switch drops the picked asset node: the node may belong to the
-  // company we just left, and the tree is about to be reloaded under the new one.
-  React.useEffect(() => {
-    // company is a trigger here, not a value the effect reads.
-    void company;
-    dispatch({ type: "assetScopeSelected", scope: null });
-  }, [company]);
 
   // The asset view's right-hand list = the flat list + a filter for the selected subtree, so both views share one list state.
   const activeAssetScope = view === "asset" ? assetScope : null;
@@ -503,19 +502,6 @@ export default function FindingsPage() {
     },
     [loadAssetTree, loadFlat, loadGroup, refreshGroups, view],
   );
-
-  // Reset every view's pagination and expansion when a shared finding filter changes.
-  React.useEffect(() => {
-    void filterFingerprint;
-    // Filters change the tree too; the previously selected node may no longer be in it, so the reducer falls back to "All assets".
-    dispatch({ type: "filterFingerprintChanged" });
-  }, [filterFingerprint]);
-
-  // Switching asset nodes means a different result set; go back to page one.
-  React.useEffect(() => {
-    void assetScope;
-    dispatch({ type: "pagination/pageChanged", page: 1 });
-  }, [assetScope]);
 
   // The asset tree is queried once on view entry / filter change (plus actively re-pulled by
   // refreshAfterMutation after this page mutates a finding); no polling.
