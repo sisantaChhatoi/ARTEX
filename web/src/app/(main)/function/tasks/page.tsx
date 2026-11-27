@@ -126,13 +126,9 @@ import { api } from "@/lib/api";
 import { getLocalStorageValue, setLocalStorageValue } from "@/lib/local-storage.client";
 import { type SortDirection, useStoredSortPreference } from "@/lib/sort-preference";
 import type {
-  AssetInterceptRuleInput,
-  TaskCredentialInput,
-  ChatAttachment,
   Company,
   DeleteTaskOptions,
   DeleteTaskResult,
-  LLMProfile,
   Task,
   TaskArchive,
   TaskArchiveState,
@@ -142,21 +138,18 @@ import type {
 import { cn } from "@/lib/utils";
 import { useActiveCompanyID } from "@/stores/company/company-store";
 
-// UPLOAD_MARKER labels the auto-appended block of uploaded-file paths inside the task
-// description, so re-uploads append under the same block instead of adding a new header.
-const UPLOAD_MARKER = "[Uploaded Files (Absolute Paths)]";
-
-// appendUploads folds newly-uploaded files' ABSOLUTE paths into the description as a
-// Read/Bash-friendly manifest — the worker opens them by path. Keeps one marked block:
-// first upload adds the header, later uploads append bullets under it.
-function appendUploads(desc: string, atts: ChatAttachment[]): string {
-  const bullets = atts.map((a) => `- ${a.abs ?? a.path} (${formatBytes(a.size)})`).join("\n");
-  if (desc.includes(UPLOAD_MARKER)) {
-    return `${desc.replace(/\s*$/, "")}\n${bullets}\n`;
-  }
-  const head = desc.trim() ? `${desc.replace(/\s*$/, "")}\n\n` : "";
-  return `${head}${UPLOAD_MARKER} worker can open them by path with Read/Bash:\n${bullets}\n`;
-}
+import {
+  type CategoryManagementView,
+  categoryManagementSheetReducer,
+  initialCategoryManagementSheetState,
+} from "./_state/category-management-sheet.reducer";
+import {
+  concurrencySettingsDialogReducer,
+  initialConcurrencySettingsDialogState,
+} from "./_state/concurrency-settings-dialog.reducer";
+import { createTaskSheetReducer, initialCreateTaskSheetState } from "./_state/create-task-sheet.reducer";
+import { initialTaskArchivesPanelState, taskArchivesPanelReducer } from "./_state/task-archives-panel.reducer";
+import { bulkControlling, initTasksPageState, moveTaskCategory, tasksPageReducer } from "./_state/tasks-page.reducer";
 
 // POLL_MS is the task-list refresh interval. Task state moves on the server (planner /
 // worker), so the list has to be pulled; 10s is plenty for status / progress / token changes.
@@ -297,14 +290,15 @@ function compareTasks(left: Task, right: Task, field: TaskSortField, direction: 
 export default function TasksPage() {
   // The sidebar's company switcher: the server returns only the tasks scoped to it.
   const companyId = useActiveCompanyID();
-  const [activeTab, setActiveTab] = React.useState("current");
-  const [tasks, setTasks] = React.useState<Task[]>([]);
-  const [categories, setCategories] = React.useState<TaskCategory[]>([]);
-  const [categoriesLoaded, setCategoriesLoaded] = React.useState(false);
-  const [query, setQuery] = React.useState("");
-  const [statusFilter, setStatusFilter] = React.useState<TaskStatus | "all">("all");
-  const [categoryFilter, setCategoryFilter] = React.useState("all");
-  const [filtersHydrated, setFiltersHydrated] = React.useState(false);
+  const [state, dispatch] = React.useReducer(tasksPageReducer, undefined, () =>
+    initTasksPageState(Math.floor(Date.now() / 1000)),
+  );
+  const { activeTab, tasks, nowSec, selectedIds } = state;
+  const { items: categories, loaded: categoriesLoaded } = state.categories;
+  const { query, status: statusFilter, category: categoryFilter, hydrated: filtersHydrated } = state.filters;
+  const { page, size: pageSize } = state.pagination;
+  const batchControlling = bulkControlling(state.bulk);
+  const movingCategory = state.bulk.moveCategory.pending;
   const [sortPreference, setSortPreference] = useStoredSortPreference(
     TASK_SORT_PREFERENCE_KEY,
     TASK_SORT_FIELDS,
@@ -312,31 +306,28 @@ export default function TasksPage() {
     "desc",
   );
   const { field: sortField, direction: sortDirection } = sortPreference;
-  const [page, setPage] = React.useState(1);
-  const [pageSize, setPageSize] = React.useState(20);
-  const [nowSec, setNowSec] = React.useState(() => Math.floor(Date.now() / 1000));
-  const [batchControlling, setBatchControlling] = React.useState<"pause" | "resume" | null>(null);
-  const [movingCategory, setMovingCategory] = React.useState(false);
 
   React.useEffect(() => {
     const raw = getLocalStorageValue(TASK_FILTER_PREFERENCE_KEY);
+    let status: TaskStatus | "all" | undefined;
+    let category: string | undefined;
     if (raw) {
       try {
         const parsed = JSON.parse(raw) as { status?: unknown; category?: unknown };
         if (parsed.status === "all" || STATUS_OPTIONS.some((option) => option.value === parsed.status)) {
-          setStatusFilter(parsed.status as TaskStatus | "all");
+          status = parsed.status as TaskStatus | "all";
         }
         if (
           typeof parsed.category === "string" &&
           (parsed.category === "all" || parsed.category === UNCATEGORIZED_VALUE || /^\d+$/.test(parsed.category))
         ) {
-          setCategoryFilter(parsed.category);
+          category = parsed.category;
         }
       } catch {
         // Ignore malformed or legacy preferences and retain the defaults.
       }
     }
-    setFiltersHydrated(true);
+    dispatch({ type: "filtersHydrated", status, category });
   }, []);
 
   React.useEffect(() => {
@@ -387,7 +378,7 @@ export default function TasksPage() {
   // reset to page 1 whenever filters or ordering change
   // biome-ignore lint/correctness/useExhaustiveDependencies: both filters intentionally reset pagination.
   React.useEffect(() => {
-    setPage(1);
+    dispatch({ type: "pagination/pageChanged", page: 1 });
   }, [query, statusFilter, categoryFilter, sortField, sortDirection]);
 
   const paginated = React.useMemo(
@@ -396,24 +387,9 @@ export default function TasksPage() {
   );
 
   // Multi-select delete: the selection survives paging/filter changes and only shrinks when a task truly disappears (deleted or no longer returned by the backend).
-  const [selectedIds, setSelectedIds] = React.useState<Set<string>>(() => new Set());
-
-  React.useEffect(() => {
-    setSelectedIds((prev) => {
-      if (prev.size === 0) return prev;
-      const live = new Set(tasks.map((t) => t.id));
-      const next = new Set([...prev].filter((id) => live.has(id)));
-      return next.size === prev.size ? prev : next;
-    });
-  }, [tasks]);
-
+  // The reducer prunes vanished IDs whenever the task list changes.
   const toggleSelected = React.useCallback((id: string, checked: boolean) => {
-    setSelectedIds((prev) => {
-      const next = new Set(prev);
-      if (checked) next.add(id);
-      else next.delete(id);
-      return next;
-    });
+    dispatch({ type: "taskSelectionToggled", id, checked });
   }, []);
 
   const pageIds = React.useMemo(() => paginated.map((t) => t.id), [paginated]);
@@ -430,14 +406,7 @@ export default function TasksPage() {
 
   const toggleSelectedPage = React.useCallback(
     (checked: boolean) => {
-      setSelectedIds((prev) => {
-        const next = new Set(prev);
-        for (const id of pageIds) {
-          if (checked) next.add(id);
-          else next.delete(id);
-        }
-        return next;
-      });
+      dispatch({ type: "pageSelectionToggled", ids: pageIds, checked });
     },
     [pageIds],
   );
@@ -455,7 +424,7 @@ export default function TasksPage() {
         const sig = JSON.stringify(next);
         if (sig === lastRef.current) return;
         lastRef.current = sig;
-        setTasks(next);
+        dispatch({ type: "tasksLoaded", tasks: next });
       })
       .catch(() => {
         // Polling is best-effort; the next interval retries automatically.
@@ -466,8 +435,7 @@ export default function TasksPage() {
     api
       .taskCategories()
       .then((next) => {
-        setCategories(next);
-        setCategoriesLoaded(true);
+        dispatch({ type: "categoriesLoaded", categories: next });
       })
       .catch(() => {
         // Category management remains retryable without blocking the task list.
@@ -489,22 +457,20 @@ export default function TasksPage() {
 
   const applyTaskCategoryMove = React.useCallback(
     (taskID: string, category: TaskCategory | null) => {
-      setTasks((current) => {
-        const next = current.map((task) =>
-          task.id === taskID ? { ...task, category_id: category?.id, category_name: category?.name } : task,
-        );
-        lastRef.current = JSON.stringify(next);
-        return next;
-      });
+      // The reducer applies the move to the latest list; the poll signature is taken from this render's list.
+      dispatch({ type: "taskCategoryMoved", taskID, category });
+      lastRef.current = JSON.stringify(moveTaskCategory(tasks, taskID, category));
       loadCategories();
     },
-    [loadCategories],
+    [loadCategories, tasks],
   );
 
   React.useEffect(() => {
     if (!categoriesLoaded) return;
     if (categoryFilter === "all" || categoryFilter === UNCATEGORIZED_VALUE) return;
-    if (!categories.some((category) => String(category.id) === categoryFilter)) setCategoryFilter("all");
+    if (!categories.some((category) => String(category.id) === categoryFilter)) {
+      dispatch({ type: "filtersChanged", patch: { category: "all" } });
+    }
   }, [categories, categoriesLoaded, categoryFilter]);
 
   // Only tick every second when there really is a running task — otherwise "duration" is static, and an idle tick would
@@ -514,8 +480,8 @@ export default function TasksPage() {
   // tick every second so running tasks' duration counts up live.
   React.useEffect(() => {
     if (!hasRunning) return;
-    setNowSec(Math.floor(Date.now() / 1000));
-    const i = setInterval(() => setNowSec(Math.floor(Date.now() / 1000)), 1000);
+    dispatch({ type: "clockTicked", nowSec: Math.floor(Date.now() / 1000) });
+    const i = setInterval(() => dispatch({ type: "clockTicked", nowSec: Math.floor(Date.now() / 1000) }), 1000);
     return () => clearInterval(i);
   }, [hasRunning]);
 
@@ -611,7 +577,7 @@ export default function TasksPage() {
       try {
         await api.archiveTask(task.id);
         toast.success(t("Task #{id} queued for archiving", { id: task.id }));
-        setActiveTab("archived");
+        dispatch({ type: "tabChanged", tab: "archived" });
         lastRef.current = "";
         load();
       } catch (error) {
@@ -656,11 +622,7 @@ export default function TasksPage() {
       }
 
       if (deleted.length > 0) {
-        setSelectedIds((prev) => {
-          const next = new Set(prev);
-          for (const id of deleted) next.delete(id);
-          return next;
-        });
+        dispatch({ type: "tasksDeselected", ids: deleted });
         const details = deleteDetails(total);
         const summary =
           details.length > 0
@@ -719,8 +681,8 @@ export default function TasksPage() {
         }),
       );
     }
-    setSelectedIds(new Set());
-    setActiveTab("archived");
+    dispatch({ type: "selection/cleared" });
+    dispatch({ type: "tabChanged", tab: "archived" });
     lastRef.current = "";
     load();
   }, [archivableTaskIDs, load]);
@@ -732,7 +694,7 @@ export default function TasksPage() {
         toast.error(t("You can control at most 100 tasks at once"));
         return;
       }
-      setBatchControlling(action);
+      dispatch({ type: "request/started", key: action });
       try {
         const result = await api.controlTasksBatch(ids, action);
         const succeeded = result.items.filter((item) => item.ok);
@@ -766,7 +728,7 @@ export default function TasksPage() {
             : t("Bulk resume failed: {error}", { error: (error as Error).message }),
         );
       } finally {
-        setBatchControlling(null);
+        dispatch({ type: "request/finished", key: action });
       }
     },
     [batchControlling, load],
@@ -781,15 +743,15 @@ export default function TasksPage() {
         toast.error(t("You can change the category of at most 100 tasks at once"));
         return;
       }
-      setMovingCategory(true);
+      dispatch({ type: "request/started", key: "moveCategory" });
       try {
         const result = await api.updateTasksCategory(ids, categoryID);
         const succeeded = result.items.filter((item) => item.ok);
         const failed = result.items.filter((item) => !item.ok);
         const target = result.category?.name ?? t("Uncategorized");
         if (succeeded.length > 0) {
-          toast.success(t("Moved {count} tasks to \"{target}\"", { count: succeeded.length, target }));
-          setSelectedIds(new Set());
+          toast.success(t('Moved {count} tasks to "{target}"', { count: succeeded.length, target }));
+          dispatch({ type: "selection/cleared" });
         }
         if (failed.length > 0) {
           const details = failed
@@ -806,14 +768,14 @@ export default function TasksPage() {
       } catch (error) {
         toast.error(t("Failed to change category: {error}", { error: (error as Error).message }));
       } finally {
-        setMovingCategory(false);
+        dispatch({ type: "request/finished", key: "moveCategory" });
       }
     },
     [movingCategory, refreshCategoriesAndTasks, selectedIds],
   );
 
   return (
-    <Tabs value={activeTab} onValueChange={setActiveTab} className="gap-4">
+    <Tabs value={activeTab} onValueChange={(tab) => dispatch({ type: "tabChanged", tab })} className="gap-4">
       <TabsList className="mx-4 lg:mx-6">
         <TabsTrigger value="current">{t("Current tasks")}</TabsTrigger>
         <TabsTrigger value="archived">{t("Archived")}</TabsTrigger>
@@ -827,13 +789,13 @@ export default function TasksPage() {
                 <Input
                   placeholder={t("Search description / goal / ID")}
                   value={query}
-                  onChange={(e) => setQuery(e.target.value)}
+                  onChange={(e) => dispatch({ type: "filtersChanged", patch: { query: e.target.value } })}
                   className="pl-8"
                 />
                 {query && (
                   <button
                     type="button"
-                    onClick={() => setQuery("")}
+                    onClick={() => dispatch({ type: "filtersChanged", patch: { query: "" } })}
                     aria-label={t("Clear search")}
                     className="text-muted-foreground hover:text-foreground absolute top-1/2 right-2 -translate-y-1/2"
                   >
@@ -841,7 +803,10 @@ export default function TasksPage() {
                   </button>
                 )}
               </div>
-              <Select value={statusFilter} onValueChange={(v) => setStatusFilter(v as TaskStatus | "all")}>
+              <Select
+                value={statusFilter}
+                onValueChange={(v) => dispatch({ type: "filtersChanged", patch: { status: v as TaskStatus | "all" } })}
+              >
                 <SelectTrigger className="w-36">
                   <SelectValue placeholder={t("Status")} />
                 </SelectTrigger>
@@ -856,7 +821,10 @@ export default function TasksPage() {
                   </SelectGroup>
                 </SelectContent>
               </Select>
-              <Select value={categoryFilter} onValueChange={setCategoryFilter}>
+              <Select
+                value={categoryFilter}
+                onValueChange={(category) => dispatch({ type: "filtersChanged", patch: { category } })}
+              >
                 <SelectTrigger className="w-40">
                   <SelectValue placeholder={t("Task category")} />
                 </SelectTrigger>
@@ -878,7 +846,7 @@ export default function TasksPage() {
               {selectedIds.size > 0 && (
                 <>
                   <span className="text-xs tabular-nums">{t("{count} selected", { count: selectedIds.size })}</span>
-                  <Button size="sm" variant="ghost" onClick={() => setSelectedIds(new Set())}>
+                  <Button size="sm" variant="ghost" onClick={() => dispatch({ type: "selection/cleared" })}>
                     {t("Clear selection")}
                   </Button>
                   {pausableTaskIDs.length > 0 && (
@@ -1035,11 +1003,8 @@ export default function TasksPage() {
               page={page}
               pageSize={pageSize}
               total={filtered.length}
-              onPageChange={setPage}
-              onPageSizeChange={(nextPageSize) => {
-                setPageSize(nextPageSize);
-                setPage(1);
-              }}
+              onPageChange={(nextPage) => dispatch({ type: "pagination/pageChanged", page: nextPage })}
+              onPageSizeChange={(nextPageSize) => dispatch({ type: "pagination/sizeChanged", size: nextPageSize })}
             />
           </CardContent>
         </Card>
@@ -1107,30 +1072,32 @@ function SortableTaskHead({
 }
 
 function ConcurrencySettingsDialog() {
-  const [open, setOpen] = React.useState(false);
-  const [enabled, setEnabled] = React.useState(false);
-  const [limit, setLimit] = React.useState("5");
-  const [loading, setLoading] = React.useState(false);
-  const [saving, setSaving] = React.useState(false);
+  const [state, dispatch] = React.useReducer(concurrencySettingsDialogReducer, initialConcurrencySettingsDialogState);
+  const { open } = state;
+  const { enabled, limit } = state.form;
+  const { pending: loading } = state.requests.load;
+  const { pending: saving } = state.requests.save;
 
   React.useEffect(() => {
     if (!open) return;
-    setLoading(true);
+    dispatch({ type: "request/started", key: "load" });
     api
       .settings()
       .then((settings) => {
-        setEnabled(!!settings.task_concurrency_enabled);
-        setLimit(String(settings.task_concurrency_limit ?? 5));
+        dispatch({
+          type: "settingsLoaded",
+          form: { enabled: !!settings.task_concurrency_enabled, limit: String(settings.task_concurrency_limit ?? 5) },
+        });
       })
       .catch(() => {
         // Keep the dialog usable with defaults; reopening retries the request.
       })
-      .finally(() => setLoading(false));
+      .finally(() => dispatch({ type: "request/finished", key: "load" }));
   }, [open]);
 
   async function save() {
     const nextLimit = Math.max(1, Math.floor(Number(limit) || 5));
-    setSaving(true);
+    dispatch({ type: "request/started", key: "save" });
     try {
       await api.setSettings({ task_concurrency_enabled: enabled, task_concurrency_limit: nextLimit });
       toast.success(
@@ -1138,16 +1105,16 @@ function ConcurrencySettingsDialog() {
           ? t("Concurrency limit enabled: at most {count} tasks can run simultaneously", { count: nextLimit })
           : t("Task concurrency limit disabled"),
       );
-      setOpen(false);
+      dispatch({ type: "openChanged", open: false });
     } catch (error) {
       toast.error(t("Save failed: {error}", { error: (error as Error).message }));
     } finally {
-      setSaving(false);
+      dispatch({ type: "request/finished", key: "save" });
     }
   }
 
   return (
-    <Dialog open={open} onOpenChange={setOpen}>
+    <Dialog open={open} onOpenChange={(nextOpen) => dispatch({ type: "openChanged", open: nextOpen })}>
       <DialogTrigger asChild>
         <Button size="sm" variant="outline" className="ml-auto" aria-label={t("Task concurrency settings")}>
           <SlidersHorizontalIcon /> {t("Concurrency")}
@@ -1168,7 +1135,12 @@ function ConcurrencySettingsDialog() {
               <Label htmlFor="task-concurrency-enabled">{t("Enable task concurrency limit")}</Label>
               <span className="text-muted-foreground text-xs">{t("Off by default")}</span>
             </div>
-            <Switch id="task-concurrency-enabled" checked={enabled} onCheckedChange={setEnabled} disabled={loading} />
+            <Switch
+              id="task-concurrency-enabled"
+              checked={enabled}
+              onCheckedChange={(checked) => dispatch({ type: "formChanged", patch: { enabled: checked } })}
+              disabled={loading}
+            />
           </div>
           {enabled && (
             <div className="grid gap-2">
@@ -1179,7 +1151,7 @@ function ConcurrencySettingsDialog() {
                 min={1}
                 className="w-32"
                 value={limit}
-                onChange={(event) => setLimit(event.target.value)}
+                onChange={(event) => dispatch({ type: "formChanged", patch: { limit: event.target.value } })}
                 disabled={loading}
               />
             </div>
@@ -1603,6 +1575,20 @@ const ARCHIVE_PROCESSING_STATES = new Set<TaskArchiveState>([
 
 const ARCHIVE_FAILED_STATES = new Set<TaskArchiveState>(["archive_failed", "restore_failed", "delete_failed"]);
 
+// Order of the states in the archive panel's status filter.
+const ARCHIVE_FILTER_STATES: TaskArchiveState[] = [
+  "archive_queued",
+  "archiving",
+  "ready",
+  "restore_queued",
+  "restoring",
+  "delete_queued",
+  "deleting",
+  "archive_failed",
+  "restore_failed",
+  "delete_failed",
+];
+
 function archiveStateLabel(state: TaskArchiveState): string {
   const labels: Record<TaskArchiveState, string> = {
     archive_queued: t("Archive queued"),
@@ -1699,14 +1685,12 @@ function ArchiveDeleteDialog({
 }
 
 function TaskArchivesPanel({ onChanged }: { onChanged: () => void }) {
-  const [archives, setArchives] = React.useState<TaskArchive[]>([]);
-  const [query, setQuery] = React.useState("");
-  const [stateFilter, setStateFilter] = React.useState("all");
-  const [page, setPage] = React.useState(1);
-  const [pageSize, setPageSize] = React.useState(20);
-  const [total, setTotal] = React.useState(0);
-  const [selected, setSelected] = React.useState<Set<number>>(() => new Set());
-  const [loading, setLoading] = React.useState(true);
+  const [panelState, dispatch] = React.useReducer(taskArchivesPanelReducer, initialTaskArchivesPanelState);
+  const { query, state: stateFilter } = panelState.filters;
+  const { page, size: pageSize } = panelState.pagination;
+  const { items: archives, total, loaded } = panelState.list;
+  const loading = !loaded;
+  const { selected } = panelState;
   const pendingRestoreIDs = React.useRef(new Set<number>());
 
   const load = React.useCallback(async () => {
@@ -1717,12 +1701,7 @@ function TaskArchivesPanel({ onChanged }: { onChanged: () => void }) {
         q: query.trim(),
         state: stateFilter === "all" ? undefined : stateFilter,
       });
-      setArchives(result.items);
-      setTotal(result.total);
-      setSelected((current) => {
-        const visible = new Set(result.items.map((archive) => archive.id));
-        return new Set([...current].filter((id) => visible.has(id)));
-      });
+      dispatch({ type: "list/loaded", items: result.items, total: result.total });
       const pending = [...pendingRestoreIDs.current];
       if (pending.length > 0) {
         const states = await Promise.allSettled(pending.map((id) => api.taskArchive(id)));
@@ -1738,7 +1717,7 @@ function TaskArchivesPanel({ onChanged }: { onChanged: () => void }) {
     } catch (error) {
       toast.error(t("Failed to load the archive list: {error}", { error: (error as Error).message }));
     } finally {
-      setLoading(false);
+      dispatch({ type: "list/loadFinished" });
     }
   }, [onChanged, page, pageSize, query, stateFilter]);
 
@@ -1766,7 +1745,7 @@ function TaskArchivesPanel({ onChanged }: { onChanged: () => void }) {
   const selectedSome = selectable.some((archive) => selected.has(archive.id));
 
   const afterAction = React.useCallback(() => {
-    setSelected(new Set());
+    dispatch({ type: "selection/cleared" });
     void load();
     onChanged();
   }, [load, onChanged]);
@@ -1846,37 +1825,23 @@ function TaskArchivesPanel({ onChanged }: { onChanged: () => void }) {
             <SearchIcon className="pointer-events-none absolute top-1/2 left-2.5 size-4 -translate-y-1/2 text-muted-foreground" />
             <Input
               value={query}
-              onChange={(event) => {
-                setQuery(event.target.value);
-                setPage(1);
-              }}
+              onChange={(event) => dispatch({ type: "queryChanged", query: event.target.value })}
               placeholder={t("Search task name / description / ID")}
               className="pl-8"
             />
           </div>
-          <Select
-            value={stateFilter}
-            onValueChange={(value) => {
-              setStateFilter(value);
-              setPage(1);
-            }}
-          >
+          <Select value={stateFilter} onValueChange={(value) => dispatch({ type: "stateFilterChanged", state: value })}>
             <SelectTrigger className="w-36">
               <SelectValue placeholder={t("State")} />
             </SelectTrigger>
             <SelectContent>
               <SelectGroup>
                 <SelectItem value="all">{t("All statuses")}</SelectItem>
-                <SelectItem value="archive_queued">{t("Archive queued")}</SelectItem>
-                <SelectItem value="archiving">{t("Archiving")}</SelectItem>
-                <SelectItem value="ready">{t("Restorable")}</SelectItem>
-                <SelectItem value="restore_queued">{t("Restore queued")}</SelectItem>
-                <SelectItem value="restoring">{t("Restoring")}</SelectItem>
-                <SelectItem value="delete_queued">{t("Delete queued")}</SelectItem>
-                <SelectItem value="deleting">{t("Deleting")}</SelectItem>
-                <SelectItem value="archive_failed">{t("Archive failed")}</SelectItem>
-                <SelectItem value="restore_failed">{t("Restore failed")}</SelectItem>
-                <SelectItem value="delete_failed">{t("Delete failed")}</SelectItem>
+                {ARCHIVE_FILTER_STATES.map((state) => (
+                  <SelectItem key={state} value={state}>
+                    {archiveStateLabel(state)}
+                  </SelectItem>
+                ))}
               </SelectGroup>
             </SelectContent>
           </Select>
@@ -1924,7 +1889,11 @@ function TaskArchivesPanel({ onChanged }: { onChanged: () => void }) {
                   <Checkbox
                     checked={selectedAll || (selectedSome ? "indeterminate" : false)}
                     onCheckedChange={(checked) =>
-                      setSelected(checked === true ? new Set(selectable.map((archive) => archive.id)) : new Set())
+                      dispatch(
+                        checked === true
+                          ? { type: "selection/set", ids: selectable.map((archive) => archive.id) }
+                          : { type: "selection/cleared" },
+                      )
                     }
                     aria-label={t("Select the archives on this page")}
                   />
@@ -1951,12 +1920,7 @@ function TaskArchivesPanel({ onChanged }: { onChanged: () => void }) {
                         checked={selected.has(archive.id)}
                         disabled={processing}
                         onCheckedChange={(checked) =>
-                          setSelected((current) => {
-                            const next = new Set(current);
-                            if (checked === true) next.add(archive.id);
-                            else next.delete(archive.id);
-                            return next;
-                          })
+                          dispatch({ type: "archiveSelectionToggled", id: archive.id, checked: checked === true })
                         }
                         aria-label={t("Select task archive #{id}", { id: archive.task_id })}
                       />
@@ -2063,11 +2027,8 @@ function TaskArchivesPanel({ onChanged }: { onChanged: () => void }) {
           page={page}
           pageSize={pageSize}
           total={total}
-          onPageChange={setPage}
-          onPageSizeChange={(size) => {
-            setPageSize(size);
-            setPage(1);
-          }}
+          onPageChange={(nextPage) => dispatch({ type: "pagination/pageChanged", page: nextPage })}
+          onPageSizeChange={(size) => dispatch({ type: "pagination/sizeChanged", size })}
         />
       </CardContent>
     </Card>
@@ -2706,8 +2667,6 @@ function CompanyPicker({
   );
 }
 
-type CategoryManagementView = number | "uncategorized" | "new";
-
 function CategoryDropTarget({
   value,
   name,
@@ -2813,14 +2772,14 @@ function CategoryManagementSheet({
   onChanged: () => void;
   onTaskMoved: (taskID: string, category: TaskCategory | null) => void;
 }) {
-  const [open, setOpen] = React.useState(false);
-  const [selectedView, setSelectedView] = React.useState<CategoryManagementView>("new");
-  const [draftName, setDraftName] = React.useState("");
-  const [saving, setSaving] = React.useState(false);
-  const [deleteOpen, setDeleteOpen] = React.useState(false);
-  const [deleting, setDeleting] = React.useState(false);
-  const [movingTaskID, setMovingTaskID] = React.useState<string | null>(null);
-  const [activeTaskID, setActiveTaskID] = React.useState<string | null>(null);
+  const [state, dispatch] = React.useReducer(categoryManagementSheetReducer, initialCategoryManagementSheetState);
+  const { open, deleteDialogOpen: deleteOpen } = state;
+  const { view: selectedView, draftName } = state.editor;
+  const { pending: saving } = state.requests.save;
+  const { pending: deleting } = state.requests.delete;
+  const { movingTaskID, activeTaskID } = state.drag;
+  const selectView = (view: CategoryManagementView, name: string) =>
+    dispatch({ type: "viewSelected", view, draftName: name });
   const wasOpen = React.useRef(false);
   const sensors = useSensors(
     useSensor(PointerSensor, { activationConstraint: { distance: 6 } }),
@@ -2831,14 +2790,11 @@ function CategoryManagementSheet({
     if (open && !wasOpen.current) {
       const first = categories[0];
       if (first) {
-        setSelectedView(first.id);
-        setDraftName(first.name);
+        dispatch({ type: "viewSelected", view: first.id, draftName: first.name });
       } else if (tasks.some((task) => task.category_id == null)) {
-        setSelectedView("uncategorized");
-        setDraftName("");
+        dispatch({ type: "viewSelected", view: "uncategorized", draftName: "" });
       } else {
-        setSelectedView("new");
-        setDraftName("");
+        dispatch({ type: "viewSelected", view: "new", draftName: "" });
       }
     }
     wasOpen.current = open;
@@ -2861,33 +2817,29 @@ function CategoryManagementSheet({
   const activeTask = React.useMemo(() => tasks.find((task) => task.id === activeTaskID) ?? null, [activeTaskID, tasks]);
 
   const selectCategory = (category: TaskCategory) => {
-    setSelectedView(category.id);
-    setDraftName(category.name);
+    selectView(category.id, category.name);
   };
 
   const selectUncategorized = () => {
-    setSelectedView("uncategorized");
-    setDraftName("");
+    selectView("uncategorized", "");
   };
 
   const startNew = () => {
-    setSelectedView("new");
-    setDraftName("");
+    selectView("new", "");
   };
 
   async function saveCategory() {
     const name = draftName.trim();
     if (!name || saving || selectedView === "uncategorized") return;
-    setSaving(true);
+    dispatch({ type: "request/started", key: "save" });
     try {
       if (selectedView === "new") {
         const created = await api.createTaskCategory(name);
-        setSelectedView(created.id);
-        setDraftName(created.name);
+        selectView(created.id, created.name);
         toast.success(t("Category created"));
       } else {
         const updated = await api.renameTaskCategory(selectedView, name);
-        setDraftName(updated.name);
+        dispatch({ type: "draftNameChanged", draftName: updated.name });
         toast.success(t("Category updated"));
       }
       onChanged();
@@ -2898,26 +2850,26 @@ function CategoryManagementSheet({
           : t("Failed to update category: {error}", { error: (error as Error).message }),
       );
     } finally {
-      setSaving(false);
+      dispatch({ type: "request/finished", key: "save" });
     }
   }
 
   async function deleteCategory() {
     if (!selectedCategory || deleting) return;
     const deletedID = selectedCategory.id;
-    setDeleting(true);
+    dispatch({ type: "request/started", key: "delete" });
     try {
       await api.deleteTaskCategory(deletedID);
       const next = categories.find((category) => category.id !== deletedID);
       if (next) selectCategory(next);
       else selectUncategorized();
       toast.success(t("Category deleted; its tasks moved to Uncategorized"));
-      setDeleteOpen(false);
+      dispatch({ type: "deleteDialogOpenChanged", open: false });
       onChanged();
     } catch (error) {
       toast.error(t("Failed to delete category: {error}", { error: (error as Error).message }));
     } finally {
-      setDeleting(false);
+      dispatch({ type: "request/finished", key: "delete" });
     }
   }
 
@@ -2931,7 +2883,7 @@ function CategoryManagementSheet({
     }
     if (task.category_id === category?.id || (task.category_id == null && category == null)) return;
 
-    setMovingTaskID(task.id);
+    dispatch({ type: "dragChanged", patch: { movingTaskID: task.id } });
     try {
       await api.updateTaskCategory(task.id, category?.id);
       onTaskMoved(task.id, category);
@@ -2939,19 +2891,20 @@ function CategoryManagementSheet({
     } catch (error) {
       toast.error(t("Failed to move task: {error}", { error: (error as Error).message }));
     } finally {
-      setMovingTaskID(null);
+      dispatch({ type: "dragChanged", patch: { movingTaskID: null } });
     }
   }
 
   function handleDragStart(event: DragStartEvent) {
     const id = String(event.active.id);
-    setActiveTaskID(id.startsWith("task:") ? id.slice("task:".length) : null);
+    const activeTaskID = id.startsWith("task:") ? id.slice("task:".length) : null;
+    dispatch({ type: "dragChanged", patch: { activeTaskID } });
   }
 
   function handleDragEnd(event: DragEndEvent) {
     const activeID = String(event.active.id);
     const taskID = activeID.startsWith("task:") ? activeID.slice("task:".length) : null;
-    setActiveTaskID(null);
+    dispatch({ type: "dragChanged", patch: { activeTaskID: null } });
     if (!taskID || !event.over) return;
     const destination = String(event.over.id);
     if (!destination.startsWith("category:")) return;
@@ -2964,7 +2917,7 @@ function CategoryManagementSheet({
 
   return (
     <>
-      <Sheet open={open} onOpenChange={setOpen}>
+      <Sheet open={open} onOpenChange={(nextOpen) => dispatch({ type: "openChanged", open: nextOpen })}>
         <SheetTrigger asChild>
           <Button size="sm" variant="outline">
             <TagsIcon data-icon="inline-start" />
@@ -2983,7 +2936,7 @@ function CategoryManagementSheet({
           <DndContext
             sensors={sensors}
             onDragStart={handleDragStart}
-            onDragCancel={() => setActiveTaskID(null)}
+            onDragCancel={() => dispatch({ type: "dragChanged", patch: { activeTaskID: null } })}
             onDragEnd={handleDragEnd}
           >
             <div className="grid min-h-0 overflow-y-auto lg:grid-cols-[15rem_minmax(0,1fr)] lg:overflow-hidden">
@@ -3024,7 +2977,7 @@ function CategoryManagementSheet({
                       <Input
                         id="task-category-name"
                         value={draftName}
-                        onChange={(event) => setDraftName(event.target.value)}
+                        onChange={(event) => dispatch({ type: "draftNameChanged", draftName: event.target.value })}
                         placeholder={t("e.g. External assessment")}
                         maxLength={80}
                         onKeyDown={(event) => {
@@ -3085,13 +3038,13 @@ function CategoryManagementSheet({
                 variant="destructive"
                 className="sm:mr-auto"
                 disabled={saving || deleting}
-                onClick={() => setDeleteOpen(true)}
+                onClick={() => dispatch({ type: "deleteDialogOpenChanged", open: true })}
               >
                 <Trash2Icon data-icon="inline-start" />
                 {t("Delete category")}
               </Button>
             )}
-            <Button type="button" variant="outline" onClick={() => setOpen(false)}>
+            <Button type="button" variant="outline" onClick={() => dispatch({ type: "openChanged", open: false })}>
               {t("Close")}
             </Button>
             {selectedView !== "uncategorized" && (
@@ -3107,7 +3060,10 @@ function CategoryManagementSheet({
           </SheetFooter>
         </SheetContent>
       </Sheet>
-      <AlertDialog open={deleteOpen} onOpenChange={setDeleteOpen}>
+      <AlertDialog
+        open={deleteOpen}
+        onOpenChange={(nextOpen) => dispatch({ type: "deleteDialogOpenChanged", open: nextOpen })}
+      >
         <AlertDialogContent>
           <AlertDialogHeader>
             <AlertDialogTitle>
@@ -3151,28 +3107,31 @@ function CreateTaskSheet({
   onCreated: () => void;
   onCategoriesChanged: () => void;
 }) {
-  const [open, setOpen] = React.useState(false);
-  const [name, setName] = React.useState("");
-  const [categoryID, setCategoryID] = React.useState<number | undefined>(undefined);
-  const [description, setDescription] = React.useState("");
-  const [goal, setGoal] = React.useState("");
-  const [selectedTemplateID, setSelectedTemplateID] = React.useState<number | null>(null);
-  const [profiles, setProfiles] = React.useState<LLMProfile[]>([]);
-  const [companies, setCompanies] = React.useState<Company[]>([]);
-  const [sourceTaskIDs, setSourceTaskIDs] = React.useState<string[]>([]);
-  const [companyIDs, setCompanyIDs] = React.useState<number[]>([]);
-  const [llmProfileIDs, setLLMProfileIDs] = React.useState<string[]>([]);
-  const [llmRotate, setLLMRotate] = React.useState(false);
-  const [creating, setCreating] = React.useState(false);
-  const [timeoutMin, setTimeoutMin] = React.useState(""); // task-level timeout (minutes); empty/0 = no limit
-  const [heartbeatMin, setHeartbeatMin] = React.useState("10"); // planner heartbeat (minutes); default 10, minimum 10 (matching the backend)
-  const [seedFirstIntent, setSeedFirstIntent] = React.useState(false); // dispatch a seed intent at creation so the worker starts without waiting for the first planner round; off by default, standard plan-then-execute
-  const [coverageEnabled, setCoverageEnabled] = React.useState(true); // asset coverage feature; on by default. Off = no coverage computed/displayed, no scope accumulation, scope-related tools hidden (company links unaffected)
-  const [interceptRules, setInterceptRules] = React.useState<AssetInterceptRuleInput[]>([]); // task-level asset intercept rules (this task only, never entering the global table)
-  const [credentials, setCredentials] = React.useState<TaskCredentialInput[]>([]); // test accounts declared at creation (#3); an empty password = the agent registers that account and records it
+  const [state, dispatch] = React.useReducer(createTaskSheetReducer, initialCreateTaskSheetState);
+  const { open, form } = state;
+  const {
+    name,
+    categoryID,
+    description,
+    goal,
+    selectedTemplateID,
+    sourceTaskIDs,
+    companyIDs,
+    llmProfileIDs,
+    llmRotate,
+    timeoutMin,
+    heartbeatMin,
+    seedFirstIntent,
+    coverageEnabled,
+    interceptRules,
+    credentials,
+  } = form;
+  const { profiles, companies } = state.options;
+  const { pending: creating } = state.requests.create;
   // Method 1, file upload: files are staged under drafts/<draftId>/uploads/ before the task is created, and their absolute paths are appended to the description.
-  const [uploading, setUploading] = React.useState(false);
-  const [uploadCount, setUploadCount] = React.useState(0);
+  const { pending: uploading } = state.requests.upload;
+  const { count: uploadCount } = state.upload;
+  const setField = (patch: Partial<typeof form>) => dispatch({ type: "formFieldChanged", patch });
   const draftIdRef = React.useRef<string>("");
   const fileInputRef = React.useRef<HTMLInputElement>(null);
   const sheetContentRef = React.useRef<HTMLDivElement>(null);
@@ -3181,12 +3140,12 @@ function CreateTaskSheet({
   React.useEffect(() => {
     api
       .llmProfiles()
-      .then(setProfiles)
-      .catch(() => setProfiles([]));
+      .then((next) => dispatch({ type: "profilesLoaded", profiles: next }))
+      .catch(() => dispatch({ type: "profilesLoaded", profiles: [] }));
     api
       .companies()
-      .then(setCompanies)
-      .catch(() => setCompanies([]));
+      .then((next) => dispatch({ type: "companiesLoaded", companies: next }))
+      .catch(() => dispatch({ type: "companiesLoaded", companies: [] }));
   }, []);
 
   // pickFiles uploads the chosen files into this draft's staging dir and appends their
@@ -3198,15 +3157,17 @@ function CreateTaskSheet({
       draftIdRef.current =
         globalThis.crypto?.randomUUID?.() ?? `d${Date.now().toString(36)}${Math.random().toString(36).slice(2, 10)}`;
     }
-    setUploading(true);
+    dispatch({ type: "request/started", key: "upload" });
     try {
       const r = await api.chatUpload("staging", draftIdRef.current, Array.from(files));
-      setDescription((prev) => appendUploads(prev, r.attachments));
-      setUploadCount((n) => n + r.attachments.length);
+      dispatch({
+        type: "filesUploaded",
+        manifestLines: r.attachments.map((a) => `- ${a.abs ?? a.path} (${formatBytes(a.size)})`),
+      });
     } catch (e) {
       toast.error(t("Upload failed: {error}", { error: (e as Error).message }));
     } finally {
-      setUploading(false);
+      dispatch({ type: "request/finished", key: "upload" });
       if (fileInputRef.current) fileInputRef.current.value = ""; // allow re-picking the same file
     }
   }
@@ -3220,7 +3181,7 @@ function CreateTaskSheet({
       toast.error(t("Link up to {count} source tasks", { count: MAX_SOURCE_TASKS }));
       return;
     }
-    setCreating(true);
+    dispatch({ type: "request/started", key: "create" });
     try {
       const timeoutSec = Math.max(0, Math.floor(Number(timeoutMin) || 0)) * 60;
       const heartbeatSec = Math.max(10, Math.floor(Number(heartbeatMin) || 10)) * 60; // minimum 10min, matching the backend's normalization
@@ -3245,34 +3206,19 @@ function CreateTaskSheet({
           .filter((c) => c.domain !== "" && c.username !== ""),
       });
       toast.success(t("Task created"));
-      setName("");
-      setCategoryID(undefined);
-      setDescription("");
-      setGoal("");
-      setSelectedTemplateID(null);
-      setSourceTaskIDs([]);
-      setCompanyIDs([]);
-      setLLMProfileIDs([]);
-      setLLMRotate(false);
-      setTimeoutMin("");
-      setHeartbeatMin("10");
-      setSeedFirstIntent(false);
-      setCoverageEnabled(true);
-      setInterceptRules([]);
-      setCredentials([]);
-      setUploadCount(0);
+      // Resets every form field and the upload count, and closes the sheet.
+      dispatch({ type: "taskCreated" });
       draftIdRef.current = "";
-      setOpen(false);
       onCreated();
     } catch (e) {
       toast.error(t("Create failed: {error}", { error: (e as Error).message }));
     } finally {
-      setCreating(false);
+      dispatch({ type: "request/finished", key: "create" });
     }
   }
 
   return (
-    <Sheet open={open} onOpenChange={setOpen}>
+    <Sheet open={open} onOpenChange={(nextOpen) => dispatch({ type: "openChanged", open: nextOpen })}>
       <SheetTrigger asChild>
         <Button size="sm">
           <PlusIcon /> {t("New task")}
@@ -3298,13 +3244,17 @@ function CreateTaskSheet({
               categoryID={categoryID}
               interceptRules={interceptRules}
               selectedTemplateID={selectedTemplateID}
-              onSelectedTemplateIDChange={setSelectedTemplateID}
+              onSelectedTemplateIDChange={(id) => setField({ selectedTemplateID: id })}
               onApply={(template) => {
-                setDescription(template.description);
-                setGoal(template.goal);
-                setCategoryID(template.category_id ?? undefined);
-                setInterceptRules(template.intercept_rules ?? []);
-                setUploadCount(0);
+                dispatch({
+                  type: "templateApplied",
+                  template: {
+                    description: template.description,
+                    goal: template.goal,
+                    categoryID: template.category_id ?? undefined,
+                    interceptRules: template.intercept_rules ?? [],
+                  },
+                });
               }}
               portalContainer={sheetContentRef}
             />
@@ -3314,7 +3264,7 @@ function CreateTaskSheet({
                 id="name"
                 placeholder={t("A recognizable name for the task, e.g. Acme website penetration test")}
                 value={name}
-                onChange={(e) => setName(e.target.value)}
+                onChange={(e) => setField({ name: e.target.value })}
               />
             </div>
             <Field>
@@ -3322,7 +3272,7 @@ function CreateTaskSheet({
               <CategoryPicker
                 categories={categories}
                 value={categoryID}
-                onValueChange={setCategoryID}
+                onValueChange={(id) => setField({ categoryID: id })}
                 onCategoryCreated={onCategoriesChanged}
                 portalContainer={sheetContentRef}
               />
@@ -3335,7 +3285,7 @@ function CreateTaskSheet({
                 className="min-h-32"
                 placeholder={t("Test target and background, e.g. test the example.com site")}
                 value={description}
-                onChange={(e) => setDescription(e.target.value)}
+                onChange={(e) => setField({ description: e.target.value })}
               />
               {/* Upload files (multi-select): staged under drafts/, with absolute paths appended to the description above so the worker can open them with Read/Bash. */}
               <div className="flex flex-wrap items-center gap-2">
@@ -3372,7 +3322,7 @@ function CreateTaskSheet({
                 className="min-h-32"
                 placeholder={t("What to achieve, e.g. gain admin panel access or server privileges")}
                 value={goal}
-                onChange={(e) => setGoal(e.target.value)}
+                onChange={(e) => setField({ goal: e.target.value })}
               />
             </div>
             <Field>
@@ -3380,7 +3330,7 @@ function CreateTaskSheet({
               <SourceTaskPicker
                 tasks={tasks}
                 value={sourceTaskIDs}
-                onValueChange={setSourceTaskIDs}
+                onValueChange={(ids) => setField({ sourceTaskIDs: ids })}
                 portalContainer={sheetContentRef}
               />
               <FieldDescription>
@@ -3395,7 +3345,7 @@ function CreateTaskSheet({
               <CompanyPicker
                 companies={companies}
                 value={companyIDs}
-                onValueChange={setCompanyIDs}
+                onValueChange={(ids) => setField({ companyIDs: ids })}
                 portalContainer={sheetContentRef}
               />
               <FieldDescription>
@@ -3406,7 +3356,10 @@ function CreateTaskSheet({
             </Field>
             <Field>
               <FieldLabel htmlFor="task-intercept-rules">{t("Task-level asset intercept / allow rules (optional)")}</FieldLabel>
-              <AssetInterceptRulesEditor value={interceptRules} onChange={setInterceptRules} />
+              <AssetInterceptRulesEditor
+                value={interceptRules}
+                onChange={(rules) => setField({ interceptRules: rules })}
+              />
               <FieldDescription>
                 {t(
                   "Applies to this task only and is not written to global rules. Evaluation order: \"Block\" rules (including global ones) match first, and a hit forbids testing; with no hit and \"Allow\" rules configured for this task, an asset must match an allow rule to be permitted, otherwise testing is likewise forbidden; with no allow rules configured, no whitelist is active.",
@@ -3419,8 +3372,8 @@ function CreateTaskSheet({
                 profiles={profiles}
                 value={llmProfileIDs}
                 rotate={llmRotate}
-                onRotateChange={setLLMRotate}
-                onValueChange={setLLMProfileIDs}
+                onRotateChange={(rotate) => setField({ llmRotate: rotate })}
+                onValueChange={(ids) => setField({ llmProfileIDs: ids })}
                 inputId="llm-profiles"
                 portalContainer={sheetContentRef}
               />
@@ -3436,26 +3389,32 @@ function CreateTaskSheet({
                     <Input
                       placeholder={t("domain (e.g. target.example.com)")}
                       value={c.domain}
-                      onChange={(e) => setCredentials((prev) => prev.map((x, j) => (j === i ? { ...x, domain: e.target.value } : x)))}
+                      onChange={(e) =>
+                        dispatch({ type: "credentialChanged", index: i, patch: { domain: e.target.value } })
+                      }
                     />
                     <Input
                       placeholder={t("email or username")}
                       value={c.username}
-                      onChange={(e) => setCredentials((prev) => prev.map((x, j) => (j === i ? { ...x, username: e.target.value } : x)))}
+                      onChange={(e) =>
+                        dispatch({ type: "credentialChanged", index: i, patch: { username: e.target.value } })
+                      }
                     />
                     <Input
                       type="password"
                       autoComplete="new-password"
                       placeholder={t("password (empty = agent generates)")}
                       value={c.password}
-                      onChange={(e) => setCredentials((prev) => prev.map((x, j) => (j === i ? { ...x, password: e.target.value } : x)))}
+                      onChange={(e) =>
+                        dispatch({ type: "credentialChanged", index: i, patch: { password: e.target.value } })
+                      }
                     />
                     <Button
                       type="button"
                       variant="ghost"
                       size="icon"
                       aria-label={t("Remove account")}
-                      onClick={() => setCredentials((prev) => prev.filter((_, j) => j !== i))}
+                      onClick={() => dispatch({ type: "credentialRemoved", index: i })}
                     >
                       <TrashIcon />
                     </Button>
@@ -3463,7 +3422,9 @@ function CreateTaskSheet({
                       className="sm:col-span-4"
                       placeholder={t("note (optional, e.g. program alias account)")}
                       value={c.note ?? ""}
-                      onChange={(e) => setCredentials((prev) => prev.map((x, j) => (j === i ? { ...x, note: e.target.value } : x)))}
+                      onChange={(e) =>
+                        dispatch({ type: "credentialChanged", index: i, patch: { note: e.target.value } })
+                      }
                     />
                   </div>
                 ))}
@@ -3472,7 +3433,7 @@ function CreateTaskSheet({
                   size="sm"
                   variant="outline"
                   className="w-fit"
-                  onClick={() => setCredentials((prev) => [...prev, { domain: "", username: "", password: "", note: "" }])}
+                  onClick={() => dispatch({ type: "credentialAdded" })}
                 >
                   <PlusIcon className="size-4" /> {t("Add account")}
                 </Button>
@@ -3501,7 +3462,7 @@ function CreateTaskSheet({
                     className="w-40"
                     placeholder={t("Empty = no limit")}
                     value={timeoutMin}
-                    onChange={(e) => setTimeoutMin(e.target.value)}
+                    onChange={(e) => setField({ timeoutMin: e.target.value })}
                   />
                   <p className="text-muted-foreground text-xs">
                     {t(
@@ -3518,7 +3479,7 @@ function CreateTaskSheet({
                     className="w-40"
                     placeholder={t("Default 10")}
                     value={heartbeatMin}
-                    onChange={(e) => setHeartbeatMin(e.target.value)}
+                    onChange={(e) => setField({ heartbeatMin: e.target.value })}
                   />
                   <p className="text-muted-foreground text-xs">
                     {t(
@@ -3531,7 +3492,7 @@ function CreateTaskSheet({
                     <Checkbox
                       id="seed-first-intent"
                       checked={seedFirstIntent}
-                      onCheckedChange={(v) => setSeedFirstIntent(!!v)}
+                      onCheckedChange={(v) => setField({ seedFirstIntent: !!v })}
                     />
                     {t("Dispatch the first intent directly (description + goal)")}
                   </label>
@@ -3546,7 +3507,7 @@ function CreateTaskSheet({
                     <Checkbox
                       id="coverage-enabled"
                       checked={coverageEnabled}
-                      onCheckedChange={(v) => setCoverageEnabled(!!v)}
+                      onCheckedChange={(v) => setField({ coverageEnabled: !!v })}
                     />
                     {t("Asset coverage feature")}
                   </label>

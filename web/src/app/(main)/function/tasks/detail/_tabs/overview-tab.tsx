@@ -33,18 +33,19 @@ import { taskAssetTypeLabel } from "@/lib/task-assets";
 import type {
   AssetInterceptKind,
   AssetInterceptRule,
-  Finding,
-  ModelTokenStat,
   NewAssetType,
-  Stats,
-  Task,
   TaskConstraint,
   TaskGoal,
-  TaskNode,
   TaskScopeRow,
 } from "@/lib/types";
 import { setVisibleInterval } from "@/lib/polling";
 import { intlLocale, t } from "@/i18n";
+
+import { initialOverviewTabState, overviewTabReducer } from "../_state/overview-tab.reducer";
+import {
+  initialTaskInterceptRulesCardState,
+  taskInterceptRulesCardReducer,
+} from "../_state/task-intercept-rules-card.reducer";
 
 // Cache hit rate = cache read / input (InputTokens already includes the cache_read subset, so the ratio is 0–100%).
 function cacheHitRate(cacheRead: number, input: number): string {
@@ -102,53 +103,28 @@ function StatCard({
 }
 
 export function OverviewTab({ taskId }: { taskId: string }) {
-  const [task, setTask] = React.useState<Task | null>(null);
-  const [stats, setStats] = React.useState<Stats | null>(null);
-  const [intents, setIntents] = React.useState<TaskNode[]>([]);
-  const [findings, setFindings] = React.useState<Finding[]>([]);
-  const [coverage, setCoverage] = React.useState<{
-    enabled: boolean;
-    scope_rows: number;
-    denominator: number;
-    tested: number;
-    pct: number | null;
-    by_type: { type: string; total: number; tested: number }[];
-    gaps?: { kind: string; surface?: string; risk_area: string }[];
-    completeness?: { complete: boolean; state: string; caveat: string };
-  } | null>(null);
-  // Intent ids currently re-running ("__all__" means the batch); used to disable buttons + spinners.
-  const [rerunning, setRerunning] = React.useState<Set<string>>(new Set());
+  const [state, dispatch] = React.useReducer(overviewTabReducer, initialOverviewTabState);
+  const { data, rerunning, modelTokens } = state;
+  const { task, stats, intents, findings, coverage } = data;
   // Test scope list + add-form state.
-  const [scope, setScope] = React.useState<TaskScopeRow[]>([]);
-  const [scopeKind, setScopeKind] = React.useState<TaskScopeRow["kind"]>("root_domain");
-  const [scopeValueInput, setScopeValueInput] = React.useState("");
-  const [scopeBusy, setScopeBusy] = React.useState(false);
-  const [scopeErr, setScopeErr] = React.useState("");
-  // Token usage per model (from the always-on llm_usage metering ledger, exact per call).
-  const [modelTokens, setModelTokens] = React.useState<ModelTokenStat[]>([]);
+  const { rows: scope } = state.scope;
+  const { pending: scopeBusy, error: scopeErr } = state.requests.scope;
+  const { kind: scopeKind, value: scopeValueInput } = state.scope.form;
   // Goal management: goal list + add form + inline edit state.
-  const [goals, setGoals] = React.useState<TaskGoal[]>([]);
-  const [goalText, setGoalText] = React.useState("");
-  const [goalVuln, setGoalVuln] = React.useState("");
-  const [goalBusy, setGoalBusy] = React.useState(false);
-  const [goalErr, setGoalErr] = React.useState("");
-  const [editingGoalId, setEditingGoalId] = React.useState<string | null>(null);
-  const [editText, setEditText] = React.useState("");
-  const [editVuln, setEditVuln] = React.useState("");
+  const { items: goals } = state.goals;
+  const { pending: goalBusy, error: goalErr } = state.requests.goals;
+  const { text: goalText, vulnclass: goalVuln } = state.goals.form;
+  const { id: editingGoalId, text: editText, vulnclass: editVuln } = state.goals.editor;
   // Constraint management: constraint list + add form + inline edit state.
-  const [constraints, setConstraints] = React.useState<TaskConstraint[]>([]);
-  const [conText, setConText] = React.useState("");
-  const [conKind, setConKind] = React.useState<TaskConstraint["kind"]>("deny");
-  const [conBusy, setConBusy] = React.useState(false);
-  const [conErr, setConErr] = React.useState("");
-  const [editingConId, setEditingConId] = React.useState<string | null>(null);
-  const [editConText, setEditConText] = React.useState("");
-  const [editConKind, setEditConKind] = React.useState<TaskConstraint["kind"]>("deny");
+  const { items: constraints } = state.constraints;
+  const { pending: conBusy, error: conErr } = state.requests.constraints;
+  const { text: conText, kind: conKind } = state.constraints.form;
+  const { id: editingConId, text: editConText, kind: editConKind } = state.constraints.editor;
 
   const loadTokens = React.useCallback(async () => {
     try {
       const resp = await api.tokensByModel(taskId);
-      setModelTokens(resp.models);
+      dispatch({ type: "tokensLoaded", models: resp.models });
     } catch {
       // Ignore: without PG the endpoint errors and the card stays empty
     }
@@ -157,7 +133,7 @@ export function OverviewTab({ taskId }: { taskId: string }) {
   const loadScope = React.useCallback(async () => {
     try {
       const resp = await api.taskScope(taskId);
-      setScope(resp.scope);
+      dispatch({ type: "scopeLoaded", rows: resp.scope });
     } catch {
       // Ignore: without an asset store the endpoint 503s and the scope card stays empty
     }
@@ -166,7 +142,7 @@ export function OverviewTab({ taskId }: { taskId: string }) {
   const loadGoals = React.useCallback(async () => {
     try {
       const resp = await api.taskGoals(taskId);
-      setGoals(resp.goals);
+      dispatch({ type: "goalsLoaded", goals: resp.goals });
     } catch {
       // Ignore: transient error, the next poll retries
     }
@@ -175,50 +151,43 @@ export function OverviewTab({ taskId }: { taskId: string }) {
   const addGoal = async () => {
     const text = goalText.trim();
     if (!text) return;
-    setGoalBusy(true);
-    setGoalErr("");
+    dispatch({ type: "request/started", key: "goals" });
     try {
       await api.addGoal(taskId, text, goalVuln.trim() || undefined);
-      setGoalText("");
-      setGoalVuln("");
+      dispatch({ type: "goalAdded" });
       await loadGoals();
     } catch (e) {
-      setGoalErr(e instanceof Error ? e.message : t("Failed to add"));
+      dispatch({ type: "request/failed", key: "goals", error: e instanceof Error ? e.message : t("Failed to add") });
     } finally {
-      setGoalBusy(false);
+      dispatch({ type: "request/finished", key: "goals" });
     }
   };
 
   const startEditGoal = (g: TaskGoal) => {
-    setEditingGoalId(g.id);
-    setEditText(g.text);
-    setEditVuln(g.vulnclass ?? "");
+    dispatch({ type: "goalEditStarted", goal: g });
   };
 
   const cancelEditGoal = () => {
-    setEditingGoalId(null);
-    setEditText("");
-    setEditVuln("");
+    dispatch({ type: "goalEditCancelled" });
   };
 
   const saveEditGoal = async (g: TaskGoal) => {
     const text = editText.trim();
     if (!text) return;
-    setGoalBusy(true);
-    setGoalErr("");
+    dispatch({ type: "request/started", key: "goals" });
     try {
       await api.updateGoal(taskId, g.id, text, editVuln.trim() || undefined);
       cancelEditGoal();
       await loadGoals();
     } catch (e) {
-      setGoalErr(e instanceof Error ? e.message : t("Failed to save"));
+      dispatch({ type: "request/failed", key: "goals", error: e instanceof Error ? e.message : t("Failed to save") });
     } finally {
-      setGoalBusy(false);
+      dispatch({ type: "request/finished", key: "goals" });
     }
   };
 
   const removeGoal = async (g: TaskGoal) => {
-    setGoals((prev) => prev.filter((x) => x.id !== g.id));
+    dispatch({ type: "goalRemoved", id: g.id });
     try {
       await api.deleteGoal(taskId, g.id);
     } catch {
@@ -229,7 +198,7 @@ export function OverviewTab({ taskId }: { taskId: string }) {
   const loadConstraints = React.useCallback(async () => {
     try {
       const resp = await api.taskConstraints(taskId);
-      setConstraints(resp.constraints);
+      dispatch({ type: "constraintsLoaded", constraints: resp.constraints });
     } catch {
       // Ignore: transient error, the next poll retries
     }
@@ -238,49 +207,51 @@ export function OverviewTab({ taskId }: { taskId: string }) {
   const addConstraint = async () => {
     const text = conText.trim();
     if (!text) return;
-    setConBusy(true);
-    setConErr("");
+    dispatch({ type: "request/started", key: "constraints" });
     try {
       await api.addConstraint(taskId, text, conKind);
-      setConText("");
+      dispatch({ type: "constraintAdded" });
       await loadConstraints();
     } catch (e) {
-      setConErr(e instanceof Error ? e.message : t("Failed to add"));
+      dispatch({
+        type: "request/failed",
+        key: "constraints",
+        error: e instanceof Error ? e.message : t("Failed to add"),
+      });
     } finally {
-      setConBusy(false);
+      dispatch({ type: "request/finished", key: "constraints" });
     }
   };
 
   const startEditConstraint = (c: TaskConstraint) => {
-    setEditingConId(c.id);
-    setEditConText(c.text);
-    setEditConKind(c.kind);
+    dispatch({ type: "constraintEditStarted", constraint: c });
   };
 
   const cancelEditConstraint = () => {
-    setEditingConId(null);
-    setEditConText("");
-    setEditConKind("deny");
+    dispatch({ type: "constraintEditCancelled" });
   };
 
   const saveEditConstraint = async (c: TaskConstraint) => {
     const text = editConText.trim();
     if (!text) return;
-    setConBusy(true);
-    setConErr("");
+    dispatch({ type: "request/started", key: "constraints" });
     try {
       await api.updateConstraint(taskId, c.id, text, editConKind);
       cancelEditConstraint();
       await loadConstraints();
     } catch (e) {
-      setConErr(e instanceof Error ? e.message : t("Failed to save"));
+      dispatch({
+        type: "request/failed",
+        key: "constraints",
+        error: e instanceof Error ? e.message : t("Failed to save"),
+      });
     } finally {
-      setConBusy(false);
+      dispatch({ type: "request/finished", key: "constraints" });
     }
   };
 
   const removeConstraint = async (c: TaskConstraint) => {
-    setConstraints((prev) => prev.filter((x) => x.id !== c.id));
+    dispatch({ type: "constraintRemoved", id: c.id });
     try {
       await api.deleteConstraint(taskId, c.id);
     } catch {
@@ -291,21 +262,20 @@ export function OverviewTab({ taskId }: { taskId: string }) {
   const addScope = async () => {
     const value = scopeValueInput.trim();
     if (!value) return;
-    setScopeBusy(true);
-    setScopeErr("");
+    dispatch({ type: "request/started", key: "scope" });
     try {
       await api.addTaskScope(taskId, scopeKind, value);
-      setScopeValueInput("");
+      dispatch({ type: "scopeAdded" });
       await loadScope();
     } catch (e) {
-      setScopeErr(e instanceof Error ? e.message : t("Failed to add"));
+      dispatch({ type: "request/failed", key: "scope", error: e instanceof Error ? e.message : t("Failed to add") });
     } finally {
-      setScopeBusy(false);
+      dispatch({ type: "request/finished", key: "scope" });
     }
   };
 
   const removeScope = async (row: TaskScopeRow) => {
-    setScope((prev) => prev.filter((s) => s.id !== row.id));
+    dispatch({ type: "scopeRemoved", id: row.id });
     try {
       await api.deleteTaskScope(taskId, row.id);
     } catch {
@@ -313,20 +283,14 @@ export function OverviewTab({ taskId }: { taskId: string }) {
     }
   };
 
-  const markRerun = (key: string, on: boolean) =>
-    setRerunning((prev) => {
-      const next = new Set(prev);
-      if (on) next.add(key);
-      else next.delete(key);
-      return next;
-    });
+  const markRerun = (key: string, on: boolean) => dispatch({ type: "rerunMarked", key, on });
 
   // Re-run one: set back to open (optimistic local state update, 3s poll as backstop); a worker re-claims it and runs from scratch.
   const rerunOne = async (id: string) => {
     markRerun(id, true);
     try {
       await api.rerunIntent(taskId, id);
-      setIntents((prev) => prev.map((i) => (i.id === id ? { ...i, state: "open" } : i)));
+      dispatch({ type: "intentRerun", id });
     } catch {
       // Ignore failures: the next poll still shows blocked and the user can click again
     } finally {
@@ -339,7 +303,7 @@ export function OverviewTab({ taskId }: { taskId: string }) {
     markRerun("__all__", true);
     try {
       await api.rerunBlocked(taskId);
-      setIntents((prev) => prev.map((i) => (i.state === "blocked" ? { ...i, state: "open" } : i)));
+      dispatch({ type: "blockedIntentsRerun" });
     } catch {
       // ignore
     } finally {
@@ -363,8 +327,9 @@ export function OverviewTab({ taskId }: { taskId: string }) {
         ]);
         if (cancelled) return;
         const activeTask = statsResp.active_task;
-        setTask(
-          activeTask
+        dispatch({
+          type: "overviewLoaded",
+          task: activeTask
             ? {
                 ...taskResp,
                 in_flight: activeTask.in_flight,
@@ -374,16 +339,16 @@ export function OverviewTab({ taskId }: { taskId: string }) {
                 paused: activeTask.paused,
               }
             : taskResp,
-        );
-        setStats(statsResp);
-        setIntents(intentsResp);
-        setFindings(findingsResp);
+          stats: statsResp,
+          intents: intentsResp,
+          findings: findingsResp,
+        });
         // coverage is independent + may 503 when no asset store — fetch separately so
         // its failure never blocks the others.
         api
           .taskCoverage(taskId)
           .then((c) => {
-            if (!cancelled) setCoverage(c);
+            if (!cancelled) dispatch({ type: "coverageLoaded", coverage: c });
           })
           .catch(() => {
             // A transient coverage failure is retried by the next poll.
@@ -470,7 +435,7 @@ export function OverviewTab({ taskId }: { taskId: string }) {
               className="h-7 min-w-56 flex-1 text-sm"
               placeholder={t("Add a goal, e.g. 'gain unauthorized access with an admin account'")}
               value={goalText}
-              onChange={(e) => setGoalText(e.target.value)}
+              onChange={(e) => dispatch({ type: "goalFormChanged", patch: { text: e.target.value } })}
               onKeyDown={(e) => {
                 if (e.key === "Enter") void addGoal();
               }}
@@ -480,7 +445,7 @@ export function OverviewTab({ taskId }: { taskId: string }) {
               className="h-7 w-32 text-sm"
               placeholder={t("Vulnerability class (optional)")}
               value={goalVuln}
-              onChange={(e) => setGoalVuln(e.target.value)}
+              onChange={(e) => dispatch({ type: "goalFormChanged", patch: { vulnclass: e.target.value } })}
               onKeyDown={(e) => {
                 if (e.key === "Enter") void addGoal();
               }}
@@ -500,7 +465,7 @@ export function OverviewTab({ taskId }: { taskId: string }) {
                     <Input
                       className="h-7 min-w-56 flex-1 text-sm"
                       value={editText}
-                      onChange={(e) => setEditText(e.target.value)}
+                      onChange={(e) => dispatch({ type: "goalEditorChanged", patch: { text: e.target.value } })}
                       onKeyDown={(e) => {
                         if (e.key === "Enter") void saveEditGoal(g);
                         if (e.key === "Escape") cancelEditGoal();
@@ -512,7 +477,7 @@ export function OverviewTab({ taskId }: { taskId: string }) {
                       className="h-7 w-32 text-sm"
                       placeholder={t("Vulnerability class (optional)")}
                       value={editVuln}
-                      onChange={(e) => setEditVuln(e.target.value)}
+                      onChange={(e) => dispatch({ type: "goalEditorChanged", patch: { vulnclass: e.target.value } })}
                       onKeyDown={(e) => {
                         if (e.key === "Enter") void saveEditGoal(g);
                         if (e.key === "Escape") cancelEditGoal();
@@ -597,7 +562,9 @@ export function OverviewTab({ taskId }: { taskId: string }) {
             <NativeSelect
               size="sm"
               value={conKind}
-              onChange={(e) => setConKind(e.target.value as TaskConstraint["kind"])}
+              onChange={(e) =>
+                dispatch({ type: "constraintFormChanged", patch: { kind: e.target.value as TaskConstraint["kind"] } })
+              }
             >
               <NativeSelectOption value="deny">{t("Deny")}</NativeSelectOption>
               <NativeSelectOption value="allow">{t("Allow")}</NativeSelectOption>
@@ -606,7 +573,7 @@ export function OverviewTab({ taskId }: { taskId: string }) {
               className="h-7 min-w-56 flex-1 text-sm"
               placeholder={t("One operation constraint, e.g. 'test only the current port, do not scan other ports'")}
               value={conText}
-              onChange={(e) => setConText(e.target.value)}
+              onChange={(e) => dispatch({ type: "constraintFormChanged", patch: { text: e.target.value } })}
               onKeyDown={(e) => {
                 if (e.key === "Enter") void addConstraint();
               }}
@@ -631,7 +598,12 @@ export function OverviewTab({ taskId }: { taskId: string }) {
                     <NativeSelect
                       size="sm"
                       value={editConKind}
-                      onChange={(e) => setEditConKind(e.target.value as TaskConstraint["kind"])}
+                      onChange={(e) =>
+                        dispatch({
+                          type: "constraintEditorChanged",
+                          patch: { kind: e.target.value as TaskConstraint["kind"] },
+                        })
+                      }
                     >
                       <NativeSelectOption value="deny">{t("Deny")}</NativeSelectOption>
                       <NativeSelectOption value="allow">{t("Allow")}</NativeSelectOption>
@@ -639,7 +611,7 @@ export function OverviewTab({ taskId }: { taskId: string }) {
                     <Input
                       className="h-7 min-w-56 flex-1 text-sm"
                       value={editConText}
-                      onChange={(e) => setEditConText(e.target.value)}
+                      onChange={(e) => dispatch({ type: "constraintEditorChanged", patch: { text: e.target.value } })}
                       onKeyDown={(e) => {
                         if (e.key === "Enter") void saveEditConstraint(c);
                         if (e.key === "Escape") cancelEditConstraint();
@@ -853,7 +825,9 @@ export function OverviewTab({ taskId }: { taskId: string }) {
             <NativeSelect
               size="sm"
               value={scopeKind}
-              onChange={(e) => setScopeKind(e.target.value as TaskScopeRow["kind"])}
+              onChange={(e) =>
+                dispatch({ type: "scopeFormChanged", patch: { kind: e.target.value as TaskScopeRow["kind"] } })
+              }
             >
               <NativeSelectOption value="root_domain">{t("Root domain")}</NativeSelectOption>
               <NativeSelectOption value="subdomain">{t("Subdomain")}</NativeSelectOption>
@@ -877,7 +851,7 @@ export function OverviewTab({ taskId }: { taskId: string }) {
                         : t("e.g. example.com")
               }
               value={scopeValueInput}
-              onChange={(e) => setScopeValueInput(e.target.value)}
+              onChange={(e) => dispatch({ type: "scopeFormChanged", patch: { value: e.target.value } })}
               onKeyDown={(e) => {
                 if (e.key === "Enter") void addScope();
               }}
@@ -1110,22 +1084,15 @@ const TASK_RULE_KIND_LABEL: Record<AssetInterceptKind, string> = Object.fromEntr
 // TaskInterceptRulesCard manages "task-level asset intercept / allow rules" on the task detail overview:
 // list + add + inline edit + delete + enable toggle. Rules apply to this task only and never enter the global table.
 function TaskInterceptRulesCard({ taskId }: { taskId: string }) {
-  const [rules, setRules] = React.useState<AssetInterceptRule[]>([]);
-  const [busy, setBusy] = React.useState(false);
-  const [err, setErr] = React.useState("");
-  const [newAction, setNewAction] = React.useState<"block" | "allow">("block");
-  const [newKind, setNewKind] = React.useState<AssetInterceptKind>("fuzzy_domain");
-  const [newPattern, setNewPattern] = React.useState("");
-  const [newNote, setNewNote] = React.useState("");
-  const [editId, setEditId] = React.useState<number | null>(null);
-  const [editAction, setEditAction] = React.useState<"block" | "allow">("block");
-  const [editKind, setEditKind] = React.useState<AssetInterceptKind>("fuzzy_domain");
-  const [editPattern, setEditPattern] = React.useState("");
-  const [editNote, setEditNote] = React.useState("");
+  const [state, dispatch] = React.useReducer(taskInterceptRulesCardReducer, initialTaskInterceptRulesCardState);
+  const { rules } = state;
+  const { pending: busy, error: err } = state.requests.save;
+  const { action: newAction, kind: newKind, pattern: newPattern, note: newNote } = state.form;
+  const { id: editId, action: editAction, kind: editKind, pattern: editPattern, note: editNote } = state.editor;
 
   const load = React.useCallback(async () => {
     try {
-      setRules(await api.taskInterceptRules(taskId));
+      dispatch({ type: "rulesLoaded", rules: await api.taskInterceptRules(taskId) });
     } catch {
       // Ignore transient errors
     }
@@ -1137,8 +1104,7 @@ function TaskInterceptRulesCard({ taskId }: { taskId: string }) {
 
   async function add() {
     if (!newPattern.trim()) return;
-    setBusy(true);
-    setErr("");
+    dispatch({ type: "request/started", key: "save" });
     try {
       await api.createTaskInterceptRule(taskId, {
         action: newAction,
@@ -1147,29 +1113,22 @@ function TaskInterceptRulesCard({ taskId }: { taskId: string }) {
         note: newNote.trim(),
         enabled: true,
       });
-      setNewPattern("");
-      setNewNote("");
+      dispatch({ type: "ruleAdded" });
       await load();
     } catch (e) {
-      setErr((e as Error).message);
+      dispatch({ type: "request/failed", key: "save", error: (e as Error).message });
     } finally {
-      setBusy(false);
+      dispatch({ type: "request/finished", key: "save" });
     }
   }
 
   function startEdit(r: AssetInterceptRule) {
-    setEditId(r.id);
-    setEditAction(r.action ?? "block");
-    setEditKind(r.kind);
-    setEditPattern(r.pattern);
-    setEditNote(r.note);
-    setErr("");
+    dispatch({ type: "editStarted", rule: r });
   }
 
   async function saveEdit(r: AssetInterceptRule) {
     if (!editPattern.trim()) return;
-    setBusy(true);
-    setErr("");
+    dispatch({ type: "request/started", key: "save" });
     try {
       await api.updateTaskInterceptRule(taskId, r.id, {
         action: editAction,
@@ -1178,17 +1137,17 @@ function TaskInterceptRulesCard({ taskId }: { taskId: string }) {
         note: editNote.trim(),
         enabled: r.enabled,
       });
-      setEditId(null);
+      dispatch({ type: "ruleSaved" });
       await load();
     } catch (e) {
-      setErr((e as Error).message);
+      dispatch({ type: "request/failed", key: "save", error: (e as Error).message });
     } finally {
-      setBusy(false);
+      dispatch({ type: "request/finished", key: "save" });
     }
   }
 
   async function remove(r: AssetInterceptRule) {
-    setRules((prev) => prev.filter((x) => x.id !== r.id));
+    dispatch({ type: "ruleRemoved", id: r.id });
     try {
       await api.deleteTaskInterceptRule(taskId, r.id);
     } catch {
@@ -1197,7 +1156,7 @@ function TaskInterceptRulesCard({ taskId }: { taskId: string }) {
   }
 
   async function toggle(r: AssetInterceptRule) {
-    setRules((prev) => prev.map((x) => (x.id === r.id ? { ...x, enabled: !x.enabled } : x)));
+    dispatch({ type: "ruleToggled", id: r.id });
     try {
       await api.toggleTaskInterceptRule(taskId, r.id, !r.enabled);
     } catch {
@@ -1222,11 +1181,19 @@ function TaskInterceptRulesCard({ taskId }: { taskId: string }) {
       <CardContent className="flex flex-col gap-3">
         {/* Add form */}
         <div className="flex flex-wrap items-center gap-2">
-          <NativeSelect size="sm" value={newAction} onChange={(e) => setNewAction(e.target.value as "block" | "allow")}>
+          <NativeSelect
+            size="sm"
+            value={newAction}
+            onChange={(e) => dispatch({ type: "formChanged", patch: { action: e.target.value as "block" | "allow" } })}
+          >
             <NativeSelectOption value="block">{t("Block")}</NativeSelectOption>
             <NativeSelectOption value="allow">{t("Allow")}</NativeSelectOption>
           </NativeSelect>
-          <NativeSelect size="sm" value={newKind} onChange={(e) => setNewKind(e.target.value as AssetInterceptKind)}>
+          <NativeSelect
+            size="sm"
+            value={newKind}
+            onChange={(e) => dispatch({ type: "formChanged", patch: { kind: e.target.value as AssetInterceptKind } })}
+          >
             {TASK_RULE_KIND_OPTIONS.map((o) => (
               <NativeSelectOption key={o.value} value={o.value}>
                 {o.label}
@@ -1237,7 +1204,7 @@ function TaskInterceptRulesCard({ taskId }: { taskId: string }) {
             className="h-7 min-w-56 flex-1 text-sm"
             placeholder={placeholder}
             value={newPattern}
-            onChange={(e) => setNewPattern(e.target.value)}
+            onChange={(e) => dispatch({ type: "formChanged", patch: { pattern: e.target.value } })}
             onKeyDown={(e) => {
               if (e.key === "Enter") void add();
             }}
@@ -1247,7 +1214,7 @@ function TaskInterceptRulesCard({ taskId }: { taskId: string }) {
             className="h-7 w-36 text-sm"
             placeholder={t("Note (optional)")}
             value={newNote}
-            onChange={(e) => setNewNote(e.target.value)}
+            onChange={(e) => dispatch({ type: "formChanged", patch: { note: e.target.value } })}
             disabled={busy}
           />
           <Button size="sm" variant="outline" disabled={busy || !newPattern.trim()} onClick={() => void add()}>
@@ -1264,7 +1231,9 @@ function TaskInterceptRulesCard({ taskId }: { taskId: string }) {
                   <NativeSelect
                     size="sm"
                     value={editAction}
-                    onChange={(e) => setEditAction(e.target.value as "block" | "allow")}
+                    onChange={(e) =>
+                      dispatch({ type: "editorChanged", patch: { action: e.target.value as "block" | "allow" } })
+                    }
                   >
                     <NativeSelectOption value="block">{t("Block")}</NativeSelectOption>
                     <NativeSelectOption value="allow">{t("Allow")}</NativeSelectOption>
@@ -1272,7 +1241,9 @@ function TaskInterceptRulesCard({ taskId }: { taskId: string }) {
                   <NativeSelect
                     size="sm"
                     value={editKind}
-                    onChange={(e) => setEditKind(e.target.value as AssetInterceptKind)}
+                    onChange={(e) =>
+                      dispatch({ type: "editorChanged", patch: { kind: e.target.value as AssetInterceptKind } })
+                    }
                   >
                     {TASK_RULE_KIND_OPTIONS.map((o) => (
                       <NativeSelectOption key={o.value} value={o.value}>
@@ -1283,10 +1254,10 @@ function TaskInterceptRulesCard({ taskId }: { taskId: string }) {
                   <Input
                     className="h-7 min-w-56 flex-1 text-sm"
                     value={editPattern}
-                    onChange={(e) => setEditPattern(e.target.value)}
+                    onChange={(e) => dispatch({ type: "editorChanged", patch: { pattern: e.target.value } })}
                     onKeyDown={(e) => {
                       if (e.key === "Enter") void saveEdit(r);
-                      if (e.key === "Escape") setEditId(null);
+                      if (e.key === "Escape") dispatch({ type: "editCancelled" });
                     }}
                     disabled={busy}
                     autoFocus
@@ -1295,7 +1266,7 @@ function TaskInterceptRulesCard({ taskId }: { taskId: string }) {
                     className="h-7 w-36 text-sm"
                     placeholder={t("Note (optional)")}
                     value={editNote}
-                    onChange={(e) => setEditNote(e.target.value)}
+                    onChange={(e) => dispatch({ type: "editorChanged", patch: { note: e.target.value } })}
                     disabled={busy}
                   />
                   <Button
@@ -1312,7 +1283,7 @@ function TaskInterceptRulesCard({ taskId }: { taskId: string }) {
                     variant="ghost"
                     className="h-6 shrink-0 px-1.5"
                     disabled={busy}
-                    onClick={() => setEditId(null)}
+                    onClick={() => dispatch({ type: "editCancelled" })}
                   >
                     <XIcon className="size-3.5" />
                   </Button>

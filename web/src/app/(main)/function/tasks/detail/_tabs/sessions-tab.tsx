@@ -58,20 +58,24 @@ import { isBtwCommand } from "@/lib/side-questions";
 import { taskAssetSourceLabel, taskAssetTypeLabel } from "@/lib/task-assets";
 import type {
   Activity,
-  ChatAttachment,
   IntentAsset,
-  InterceptApprovalRow,
   Session,
   SessionStatus,
-  SessionTokenUsage,
   TaskLLMResolution,
-  TaskLLMResolutions,
   TaskNode,
   TokenTotal,
 } from "@/lib/types";
 import { cn } from "@/lib/utils";
 import { setVisibleInterval } from "@/lib/polling";
 import { intlLocale, t } from "@/i18n";
+
+import {
+  emptyState,
+  initSessionsTabState,
+  mergeBySeq,
+  type SessionStore,
+  sessionsTabReducer,
+} from "../_state/sessions-tab.reducer";
 
 // resolutionLabel names the LLM a session runs on. The badge shows this alone and
 // keeps the model id in its tooltip. Env-backed configs can arrive without a name,
@@ -117,35 +121,6 @@ function workerMessageCharCount(value: string): number {
   return Array.from(value).length;
 }
 
-// One session's lazily-loaded, reverse-paginated cache. `lastTs`/`unread` are kept
-// live even for sessions that were never opened, so the list shows liveness + unread
-// without holding their full history.
-type SessionState = {
-  items: Activity[];
-  loaded: boolean;
-  loading: boolean;
-  loadingMore: boolean;
-  hasMore: boolean; // older history remains above the loaded window
-  earliestSeq: number; // earliest loaded id — reverse-pagination anchor
-  unread: number;
-  lastTs: string; // most-recent activity time (drives live badge; updated even when unloaded)
-  error?: string;
-};
-type SessionStore = Record<string, SessionState>;
-
-function emptyState(): SessionState {
-  return {
-    items: [],
-    loaded: false,
-    loading: false,
-    loadingMore: false,
-    hasMore: false,
-    earliestSeq: 0,
-    unread: 0,
-    lastTs: "",
-  };
-}
-
 // sessionKeyOf routes an activity to its stable session key. worker="planner" covers
 // BOTH the Goal Agent's round-0 decomposition and the Planner (single Plan session).
 function sessionKeyOf(a: Activity): string {
@@ -154,17 +129,6 @@ function sessionKeyOf(a: Activity): string {
   if (a.worker === "planner") return "plan";
   if (a.intent_id) return `intent:${a.intent_id}`;
   return "unknown";
-}
-
-// mergeBySeq unions two activity lists by seq (dedup) in ascending seq order. Every
-// data source — latest page, older page, SSE compensation, live tail — goes through
-// this, so history responses can never clobber live records received meanwhile.
-function mergeBySeq(current: Activity[], incoming: Activity[]): Activity[] {
-  if (!incoming.length) return current;
-  const bySeq = new Map<number, Activity>();
-  for (const a of current) bySeq.set(a.seq, a);
-  for (const a of incoming) bySeq.set(a.seq, a);
-  return [...bySeq.values()].sort((p, q) => p.seq - q.seq);
 }
 
 // statusIcon maps a session status to its icon. Worker terminal states are
@@ -468,7 +432,28 @@ function WorkerAssetBadge({ assets }: { assets: IntentAsset[] }) {
 
 export function SessionsTab({ taskId, taskPaused = false }: { taskId: string; taskPaused?: boolean }) {
   const approvalFocus = useApprovalFocus({ taskId });
-  const [selectedSessionId, setActiveId] = React.useState(MAIN_ID);
+  const [state, dispatch] = React.useReducer(sessionsTabReducer, MAIN_ID, initSessionsTabState);
+  const { store } = state;
+  const { selectedSessionId, locatedSession, listOpen } = state.nav;
+  const { segs: mainSegs, currentSeg, confirmNew: confirmNewMain, chatRunning: mainChatRunning } = state.main;
+  const {
+    intents,
+    olderIntents,
+    firstHasMore: firstIntentsHasMore,
+    olderHasMore: olderIntentsHasMore,
+    hasLoadedOlderPage: hasLoadedOlderIntentsPage,
+    loadingOlder: loadingOlderIntents,
+    assets: intentAssets,
+  } = state.workers;
+  const { input, attachments } = state.composer;
+  const { message: workerMessage, requestId: workerMessageRequestId } = state.workerChat;
+  const creatingMain = state.requests.createMain.pending;
+  const uploading = state.requests.upload.pending;
+  const sending = state.requests.send.pending;
+  const stopping = state.requests.stop.pending;
+  const workerMessageSending = state.requests.workerSend.pending;
+  const { controllingIntent, cancelIntent, cancelReason, deleteMode } = state.workerControl;
+  const { sseLive, taskTokens, sessionTokens, llmResolutions, pendingIntercepts } = state.taskStatus;
   const focusSession = React.useMemo<Session | undefined>(() => {
     const source = approvalFocus.state?.source;
     if (!source) return undefined;
@@ -492,58 +477,23 @@ export function SessionsTab({ taskId, taskPaused = false }: { taskId: string; ta
     return undefined;
   }, [approvalFocus.state?.source]);
   // Keep a located archived/older session selectable after leaving focus mode.
-  const [locatedSession, setLocatedSession] = React.useState<{ taskId: string; session: Session }>();
   React.useEffect(() => {
-    if (focusSession) setLocatedSession({ taskId, session: focusSession });
+    if (focusSession) dispatch({ type: "navChanged", patch: { locatedSession: { taskId, session: focusSession } } });
   }, [taskId, focusSession]);
   const retainedSession = locatedSession?.taskId === taskId ? locatedSession.session : undefined;
   const activeId = focusSession?.id ?? selectedSessionId;
-  // Main-agent conversation segments (newest-first); currentSeg is the writable one.
-  const [mainSegs, setMainSegs] = React.useState<{ seq: number; created_at: string }[]>([{ seq: 0, created_at: "" }]);
-  const [currentSeg, setCurrentSeg] = React.useState(0);
-  const [creatingMain, setCreatingMain] = React.useState(false);
-  const [confirmNewMain, setConfirmNewMain] = React.useState(false);
-  // On mobile (<lg) the session list is collapsed by default: screen height is already tight, and a fixed 10~15rem list
-  // would squeeze the transcript below down to just the header and input. Collapsed, the transcript gets nearly all the height;
-  // tapping the title bar expands it to pick a session, collapsing again after choosing. Desktop is unaffected (always expanded from lg up).
-  const [listOpen, setListOpen] = React.useState(false);
-  // Per-session lazily-loaded caches, keyed by session_key (main | plan | intent:<id>).
-  const [store, setStore] = React.useState<SessionStore>({});
-  // Worker sessions derived from exploration intents (paged past the old 300 cap).
-  const [intents, setIntents] = React.useState<TaskNode[]>([]);
-  const [intentAssets, setIntentAssets] = React.useState<IntentAsset[]>([]);
-  const [olderIntents, setOlderIntents] = React.useState<TaskNode[]>([]);
-  const [firstIntentsHasMore, setFirstIntentsHasMore] = React.useState(false);
-  const [olderIntentsHasMore, setOlderIntentsHasMore] = React.useState(false);
-  const [hasLoadedOlderIntentsPage, setHasLoadedOlderIntentsPage] = React.useState(false);
-  const [loadingOlderIntents, setLoadingOlderIntents] = React.useState(false);
-  const [input, setInput] = React.useState("");
-  const [sending, setSending] = React.useState(false);
-  const [stopping, setStopping] = React.useState(false);
-  const [mainChatRunning, setMainChatRunning] = React.useState<boolean | null>(null);
-  const [controllingIntent, setControllingIntent] = React.useState<string | null>(null);
-  const [cancelIntent, setCancelIntent] = React.useState<Session | null>(null);
-  const [cancelReason, setCancelReason] = React.useState("");
-  // Delete mode: soft = soft delete (default, sets deleted + records the reason, keeps data) | hard = hard delete (cascade-removes exclusive descendants).
-  const [deleteMode, setDeleteMode] = React.useState<"soft" | "hard">("soft");
-  const [workerMessage, setWorkerMessage] = React.useState("");
-  const [workerMessageRequestId, setWorkerMessageRequestId] = React.useState("");
-  const [workerMessageSending, setWorkerMessageSending] = React.useState(false);
-  // Method 1, file upload: chosen attachments (already landed in the task work dir uploads/) are sent with the next message.
-  const [attachments, setAttachments] = React.useState<ChatAttachment[]>([]);
-  const [uploading, setUploading] = React.useState(false);
   const fileInputRef = React.useRef<HTMLInputElement>(null);
 
   async function pickFiles(files: FileList | null) {
     if (!files || files.length === 0) return;
-    setUploading(true);
+    dispatch({ type: "request/started", key: "upload" });
     try {
       const r = await api.chatUpload("task", taskId, Array.from(files));
-      setAttachments((prev) => [...prev, ...r.attachments]);
+      dispatch({ type: "attachmentsUploaded", attachments: r.attachments });
     } catch (e) {
       toast.error(t("Upload failed: {error}", { error: (e as Error).message }));
     } finally {
-      setUploading(false);
+      dispatch({ type: "request/finished", key: "upload" });
       if (fileInputRef.current) fileInputRef.current.value = "";
     }
   }
@@ -553,31 +503,26 @@ export function SessionsTab({ taskId, taskPaused = false }: { taskId: string; ta
   // clean context. The old segment stays as read-only history you can switch back to.
   async function createMainSession() {
     if (creatingMain) return;
-    setCreatingMain(true);
+    dispatch({ type: "request/started", key: "createMain" });
     try {
       const r = await api.newMainSession(taskId);
-      setMainSegs((prev) => [{ seq: r.seq, created_at: r.created_at }, ...prev.filter((m) => m.seq !== r.seq)]);
-      setCurrentSeg(r.current ?? r.seq);
-      // Seed an empty, loaded state so the new (empty) session renders immediately.
-      setStore((prev) => ({ ...prev, [mainSessionKey(r.seq)]: { ...emptyState(), loaded: true } }));
-      setActiveId(mainSessionId(r.seq));
-      setListOpen(false);
-      setInput("");
+      // Also seeds an empty, loaded state so the new (empty) session renders immediately.
+      dispatch({
+        type: "mainSessionCreated",
+        segment: { seq: r.seq, created_at: r.created_at },
+        current: r.current ?? r.seq,
+        key: mainSessionKey(r.seq),
+        id: mainSessionId(r.seq),
+      });
     } catch (e) {
       toast.error(t("Failed to create session: {error}", { error: (e as Error).message }));
     } finally {
-      setCreatingMain(false);
-      setConfirmNewMain(false);
+      dispatch({ type: "mainSessionCreateFinished" });
     }
   }
 
   const patchIntentState = React.useCallback((intentId: string, state?: string) => {
-    const patch = (rows: TaskNode[]) =>
-      state
-        ? rows.map((row) => (row.id === intentId ? { ...row, state } : row))
-        : rows.filter((row) => row.id !== intentId);
-    setIntents(patch);
-    setOlderIntents(patch);
+    dispatch({ type: "intentStatePatched", intentId, state });
   }, []);
 
   const controlWorker = React.useCallback(
@@ -587,7 +532,7 @@ export function SessionsTab({ taskId, taskPaused = false }: { taskId: string; ta
         toast.error(t("Please provide a deletion reason"));
         return;
       }
-      setControllingIntent(session.intent_id);
+      dispatch({ type: "workerControlChanged", patch: { controllingIntent: session.intent_id } });
       try {
         const res = await api.controlIntent(taskId, session.intent_id, action, reason, mode);
         if (action === "pause") {
@@ -608,32 +553,21 @@ export function SessionsTab({ taskId, taskPaused = false }: { taskId: string; ta
                 )
               : t("Worker #{id} and its exclusive downstream were permanently deleted", { id: session.intent_id }),
           );
-          setCancelReason("");
+          dispatch({ type: "workerControlChanged", patch: { cancelReason: "" } });
         } else {
           // Soft delete: the intent is set to deleted with the reason recorded; nodes and output are kept.
           patchIntentState(session.intent_id, "deleted");
           toast.success(t("Worker #{id} deleted (reason recorded; the planner will re-plan accordingly)", { id: session.intent_id }));
-          setCancelReason("");
+          dispatch({ type: "workerControlChanged", patch: { cancelReason: "" } });
         }
       } catch (error) {
         toast.error(t("Worker operation failed: {error}", { error: (error as Error).message }));
       } finally {
-        setControllingIntent(null);
-        setCancelIntent(null);
+        dispatch({ type: "workerControlFinished" });
       }
     },
     [controllingIntent, patchIntentState, taskId],
   );
-
-  // SSE connection state — surfaced so a dropped realtime link is visible, never
-  // silently shown as "no messages".
-  const [sseLive, setSseLive] = React.useState(false);
-  // Whole-task token total (all agents), polled from the backend aggregate.
-  const [taskTokens, setTaskTokens] = React.useState<TokenTotal | null>(null);
-  const [sessionTokens, setSessionTokens] = React.useState<Record<string, SessionTokenUsage>>({});
-  const [llmResolutions, setLLMResolutions] = React.useState<TaskLLMResolutions | null>(null);
-  // Pending intercept requests for this task — used to show warning icons on sessions.
-  const [pendingIntercepts, setPendingIntercepts] = React.useState<InterceptApprovalRow[]>([]);
 
   // Refs backing SSE/loading without re-render churn.
   const snapshotRef = React.useRef(0); // task-level snapshot cursor → SSE since=
@@ -652,11 +586,6 @@ export function SessionsTab({ taskId, taskPaused = false }: { taskId: string; ta
   // former also opens the SSE, so it must not be pre-empted).
   const loadingKeysRef = React.useRef<Set<string>>(new Set());
 
-  // ── store helpers ──────────────────────────────────────────────────────────────
-  const patchStore = React.useCallback((key: string, fn: (s: SessionState) => SessionState) => {
-    setStore((prev) => ({ ...prev, [key]: fn(prev[key] ?? emptyState()) }));
-  }, []);
-
   // Load a session's LATEST page (before=0) on first open. Keyed + request-token
   // guarded so a switch away can't corrupt the view.
   const loadSession = React.useCallback(
@@ -666,7 +595,7 @@ export function SessionsTab({ taskId, taskPaused = false }: { taskId: string; ta
       loadingKeysRef.current.add(key);
       const token = (reqTokenRef.current[key] ?? 0) + 1;
       reqTokenRef.current[key] = token;
-      patchStore(key, (s) => ({ ...s, loading: true, error: undefined }));
+      dispatch({ type: "sessionLoadStarted", key });
 
       if (key === "system") {
         void (async () => {
@@ -684,28 +613,11 @@ export function SessionsTab({ taskId, taskPaused = false }: { taskId: string; ta
             if (page.items.length < SYSTEM_SCAN_PAGE || page.cursor <= since) break;
             since = page.cursor;
           }
-          patchStore(key, (s) => {
-            const items = mergeBySeq(systemItems, s.items);
-            return {
-              ...s,
-              items,
-              loaded: true,
-              loading: false,
-              hasMore: false,
-              earliestSeq: items.length ? items[0].seq : 0,
-              unread: 0,
-              lastTs: items.length ? items[items.length - 1].ts : s.lastTs,
-              error: undefined,
-            };
-          });
+          dispatch({ type: "systemHistoryLoaded", key, items: systemItems });
         })()
           .catch((error) => {
             if (reqTokenRef.current[key] !== token) return;
-            patchStore(key, (s) => ({
-              ...s,
-              loading: false,
-              error: (error as Error).message || t("Failed to load"),
-            }));
+            dispatch({ type: "sessionLoadFailed", key, error: (error as Error).message || t("Failed to load") });
           })
           .finally(() => loadingKeysRef.current.delete(key));
         return;
@@ -716,27 +628,15 @@ export function SessionsTab({ taskId, taskPaused = false }: { taskId: string; ta
         .then((r) => {
           if (reqTokenRef.current[key] !== token) return; // superseded
           if (r.snapshotCursor > snapshotRef.current) snapshotRef.current = r.snapshotCursor;
-          patchStore(key, (s) => {
-            const items = mergeBySeq(r.items, s.items); // keep any live frames arrived meanwhile
-            return {
-              ...s,
-              items,
-              loaded: true,
-              loading: false,
-              hasMore: r.hasMore,
-              earliestSeq: items.length ? items[0].seq : 0,
-              unread: 0,
-              error: undefined,
-            };
-          });
+          dispatch({ type: "sessionLatestLoaded", key, items: r.items, hasMore: r.hasMore }); // keeps live frames arrived meanwhile
         })
         .catch((e) => {
           if (reqTokenRef.current[key] !== token) return;
-          patchStore(key, (s) => ({ ...s, loading: false, error: (e as Error).message || t("Failed to load") }));
+          dispatch({ type: "sessionLoadFailed", key, error: (e as Error).message || t("Failed to load") });
         })
         .finally(() => loadingKeysRef.current.delete(key));
     },
-    [taskId, patchStore],
+    [taskId],
   );
 
   // Load one older page (scroll-up) for a session, preserving scroll position.
@@ -747,30 +647,21 @@ export function SessionsTab({ taskId, taskPaused = false }: { taskId: string; ta
       const vp = viewport();
       const prevH = vp?.scrollHeight ?? 0;
       const prevTop = vp?.scrollTop ?? 0;
-      patchStore(key, (s) => ({ ...s, loadingMore: true }));
+      dispatch({ type: "sessionOlderLoadStarted", key });
       api
         .activityHistory(taskId, key, st.earliestSeq, PAGE)
         .then((r) => {
-          patchStore(key, (s) => {
-            const items = mergeBySeq(r.items, s.items);
-            return {
-              ...s,
-              items,
-              loadingMore: false,
-              hasMore: r.hasMore,
-              earliestSeq: items.length ? items[0].seq : s.earliestSeq,
-            };
-          });
+          dispatch({ type: "sessionOlderLoaded", key, items: r.items, hasMore: r.hasMore });
           requestAnimationFrame(() => {
             const v = viewport();
             if (v) v.scrollTop = prevTop + (v.scrollHeight - prevH);
           });
         })
         .catch(() => {
-          patchStore(key, (s) => ({ ...s, loadingMore: false }));
+          dispatch({ type: "sessionOlderLoadFailed", key });
         });
     },
-    [taskId, store, patchStore],
+    [taskId, store],
   );
 
   // ── task token total (whole task, all agents) ───────────────────────────────────
@@ -781,8 +672,7 @@ export function SessionsTab({ taskId, taskPaused = false }: { taskId: string; ta
         .tokenStats(taskId)
         .then((r) => {
           if (!alive) return;
-          setTaskTokens(r.total);
-          setSessionTokens(Object.fromEntries(r.sessions.map((item) => [item.session, item])));
+          dispatch({ type: "tokenStatsLoaded", total: r.total, sessions: r.sessions });
         })
         .catch(() => {
           // Polling is best-effort; the next interval retries automatically.
@@ -797,13 +687,14 @@ export function SessionsTab({ taskId, taskPaused = false }: { taskId: string; ta
 
   React.useEffect(() => {
     let alive = true;
-    setMainChatRunning(null);
+    dispatch({ type: "mainChanged", patch: { chatRunning: null } });
     const load = () => {
       const request = ++chatStatusRequestRef.current;
       return api
         .chatStatus(taskId)
         .then(({ running }) => {
-          if (alive && chatStatusRequestRef.current === request) setMainChatRunning(running);
+          if (alive && chatStatusRequestRef.current === request)
+            dispatch({ type: "mainChanged", patch: { chatRunning: running } });
         })
         .catch(() => {
           // Keep the last authoritative value. Before the first success, recent
@@ -824,7 +715,7 @@ export function SessionsTab({ taskId, taskPaused = false }: { taskId: string; ta
       api
         .taskLLMResolution(taskId)
         .then((value) => {
-          if (alive) setLLMResolutions(value);
+          if (alive) dispatch({ type: "taskStatusChanged", patch: { llmResolutions: value } });
         })
         .catch(() => {
           // Polling is best-effort; the next interval retries automatically.
@@ -843,7 +734,8 @@ export function SessionsTab({ taskId, taskPaused = false }: { taskId: string; ta
       api
         .interceptTask(taskId)
         .then((rows) => {
-          if (alive) setPendingIntercepts(rows.filter((r) => r.status === "pending"));
+          const pendingIntercepts = rows.filter((r) => r.status === "pending");
+          if (alive) dispatch({ type: "taskStatusChanged", patch: { pendingIntercepts } });
         })
         .catch(() => {
           // Polling is best-effort; the next interval retries automatically.
@@ -857,9 +749,8 @@ export function SessionsTab({ taskId, taskPaused = false }: { taskId: string; ta
   }, [taskId]);
 
   // Re-render on a timer so "streaming" liveness recomputes as activity goes stale.
-  const [, setTick] = React.useState(0);
   React.useEffect(() => {
-    const id = setInterval(() => setTick((t) => t + 1), 1500);
+    const id = setInterval(() => dispatch({ type: "ticked" }), 1500);
     return () => clearInterval(id);
   }, []);
 
@@ -870,20 +761,7 @@ export function SessionsTab({ taskId, taskPaused = false }: { taskId: string; ta
   // by session_key. EventSource auto-reconnects and (via our `id:` lines → Last-Event-
   // ID) resumes from the DB, so a dropped realtime link self-heals; seq-merge dedups.
   React.useEffect(() => {
-    setStore({});
-    setIntents([]);
-    setIntentAssets([]);
-    setOlderIntents([]);
-    setFirstIntentsHasMore(false);
-    setOlderIntentsHasMore(false);
-    setHasLoadedOlderIntentsPage(false);
-    setTaskTokens(null);
-    setSessionTokens({});
-    setLLMResolutions(null);
-    setSseLive(false);
-    setActiveId(MAIN_ID); // a stale worker id from the previous task must not leak in
-    setMainSegs([{ seq: 0, created_at: "" }]);
-    setCurrentSeg(0);
+    dispatch({ type: "taskChanged", mainId: MAIN_ID }); // a stale worker id from the previous task must not leak in
     snapshotRef.current = 0;
     llmToastSeqRef.current = new Set();
     reqTokenRef.current = {};
@@ -914,12 +792,15 @@ export function SessionsTab({ taskId, taskPaused = false }: { taskId: string; ta
           }
           buckets[mainSessionKey(0)] ??= { ...emptyState(), loaded: true };
           buckets.system ??= { ...emptyState(), loaded: true };
-          setStore(buckets);
+          dispatch({ type: "storeReplaced", store: buckets });
         })
         .catch(() =>
-          setStore({
-            [mainSessionKey(0)]: { ...emptyState(), loaded: true },
-            system: { ...emptyState(), loaded: true },
+          dispatch({
+            type: "storeReplaced",
+            store: {
+              [mainSessionKey(0)]: { ...emptyState(), loaded: true },
+              system: { ...emptyState(), loaded: true },
+            },
           }),
         );
       return () => {
@@ -938,37 +819,29 @@ export function SessionsTab({ taskId, taskPaused = false }: { taskId: string; ta
       .then((ms) => {
         if (!alive || reqTokenRef.current.mainboot !== token) throw new Error("superseded");
         const segs = ms.sessions.length ? ms.sessions : [{ seq: 0, created_at: "" }];
-        setMainSegs(segs);
-        setCurrentSeg(ms.current);
         bootKey = mainSessionKey(ms.current);
         if (bootKey !== mainSessionKey(0)) loadingKeysRef.current.delete(mainSessionKey(0));
         loadingKeysRef.current.add(bootKey);
-        setActiveId(mainSessionId(ms.current));
-        patchStore(bootKey, (s) => ({ ...s, loading: true }));
+        dispatch({
+          type: "mainSegmentsResolved",
+          segs,
+          current: ms.current,
+          key: bootKey,
+          id: mainSessionId(ms.current),
+        });
         return api.activityHistory(taskId, bootKey, 0, PAGE);
       })
       .then((r) => {
         if (!alive || reqTokenRef.current.mainboot !== token) return;
         snapshotRef.current = r.snapshotCursor;
-        patchStore(bootKey, (s) => {
-          const items = mergeBySeq(r.items, s.items);
-          return {
-            ...s,
-            items,
-            loaded: true,
-            loading: false,
-            hasMore: r.hasMore,
-            earliestSeq: items.length ? items[0].seq : 0,
-            unread: 0,
-          };
-        });
+        dispatch({ type: "mainBootHistoryLoaded", key: bootKey, items: r.items, hasMore: r.hasMore });
         // Open the single task SSE from the snapshot cursor.
         const es = new EventSource(
           sseUrl(`/api/exploration/activity/stream?task=${encodeURIComponent(taskId)}&since=${snapshotRef.current}`),
         );
         esRef.current = es;
-        es.onopen = () => setSseLive(true);
-        es.onerror = () => setSseLive(false); // EventSource auto-reconnects; DB compensates the gap
+        es.onopen = () => dispatch({ type: "taskStatusChanged", patch: { sseLive: true } });
+        es.onerror = () => dispatch({ type: "taskStatusChanged", patch: { sseLive: false } }); // EventSource auto-reconnects; DB compensates the gap
         es.onmessage = (e) => {
           let a: Activity;
           try {
@@ -989,48 +862,30 @@ export function SessionsTab({ taskId, taskPaused = false }: { taskId: string; ta
             void api
               .taskLLMResolution(taskId)
               .then((value) => {
-                if (alive) setLLMResolutions(value);
+                if (alive) dispatch({ type: "taskStatusChanged", patch: { llmResolutions: value } });
               })
               .catch(() => {
                 // The periodic resolver poll will retry if this event-triggered refresh fails.
               });
           }
           const k = sessionKeyOf(a);
-          setStore((prev) => {
-            const cur = prev[k] ?? emptyState();
-            const activeK = activeKeyRef.current;
-            // Merge into sessions that are loaded, actively loading, or the current
-            // view (so returning is instant + a frame that lands mid-load isn't lost).
-            // A cold, inactive session also keeps a tiny accounting tail so the
-            // sidebar can add the latest unfinished usage without loading history.
-            if (!cur.loaded && !cur.loading && k !== activeK) {
-              const accountingItems =
-                a.kind === "usage" || a.kind === "result" ? mergeBySeq(cur.items, [a]).slice(-4) : cur.items;
-              return {
-                ...prev,
-                [k]: { ...cur, items: accountingItems, lastTs: a.ts, unread: cur.unread + 1 },
-              };
-            }
-            let items = mergeBySeq(cur.items, [a]);
-            // Memory bound: trim oldest when over cap (older re-fetched on scroll-up),
-            // but never while the user is reading this session's history (scrolled up).
-            let hasMore = cur.hasMore;
-            let earliestSeq = cur.earliestSeq;
-            const trimmable = k !== activeK || atBottomRef.current;
-            if (trimmable && items.length > MAX_KEEP) {
-              items = items.slice(items.length - MAX_KEEP);
-              hasMore = true;
-              earliestSeq = items[0].seq;
-            }
-            const unread = k === activeK ? 0 : cur.unread + 1;
-            return { ...prev, [k]: { ...cur, items, lastTs: a.ts, unread, hasMore, earliestSeq } };
+          // Merged into the session cache by the reducer (loaded/loading/active sessions get
+          // the frame; cold ones keep only an accounting tail). The active key and the
+          // pinned-to-bottom flag are read here, when the frame arrives.
+          dispatch({
+            type: "activityReceived",
+            key: k,
+            activity: a,
+            activeKey: activeKeyRef.current,
+            atBottom: atBottomRef.current,
+            maxKeep: MAX_KEEP,
           });
         };
       })
       .catch((err) => {
         if (!alive || reqTokenRef.current.mainboot !== token) return;
         if ((err as Error).message === "superseded") return;
-        patchStore(bootKey, (s) => ({ ...s, loading: false, error: (err as Error).message || t("Failed to load") }));
+        dispatch({ type: "sessionLoadFailed", key: bootKey, error: (err as Error).message || t("Failed to load") });
       })
       .finally(() => loadingKeysRef.current.delete(bootKey));
 
@@ -1039,7 +894,7 @@ export function SessionsTab({ taskId, taskPaused = false }: { taskId: string; ta
       esRef.current?.close();
       esRef.current = null;
     };
-  }, [taskId, patchStore]);
+  }, [taskId]);
 
   React.useEffect(() => {
     let active = true;
@@ -1047,7 +902,7 @@ export function SessionsTab({ taskId, taskPaused = false }: { taskId: string; ta
       api
         .taskIntentAssets(taskId)
         .then((assets) => {
-          if (active) setIntentAssets(assets);
+          if (active) dispatch({ type: "workersChanged", patch: { assets } });
         })
         .catch(() => {
           // The next poll retries; Worker controls and transcripts remain available.
@@ -1064,10 +919,7 @@ export function SessionsTab({ taskId, taskPaused = false }: { taskId: string; ta
   React.useEffect(() => {
     let active = true;
     firstIntentsRef.current = [];
-    setIntents([]);
-    setOlderIntents([]);
-    setFirstIntentsHasMore(false);
-    setOlderIntentsHasMore(false);
+    dispatch({ type: "intentsReset" });
     const load = () =>
       api
         .intentsPage(taskId, 0, 300)
@@ -1078,16 +930,9 @@ export function SessionsTab({ taskId, taskPaused = false }: { taskId: string; ta
           const displaced = r.hasMore
             ? firstIntentsRef.current.filter((item) => !freshIds.has(item.id) && Number(item.id) < oldestFreshId)
             : [];
-          if (displaced.length > 0) {
-            setOlderIntents((previous) => {
-              const byId = new Map(previous.map((item) => [item.id, item]));
-              for (const item of displaced) byId.set(item.id, item);
-              return [...byId.values()];
-            });
-          }
+          // Displaced items are merged into the older list by the reducer.
           firstIntentsRef.current = r.items;
-          setIntents(r.items);
-          setFirstIntentsHasMore(r.hasMore);
+          dispatch({ type: "firstIntentsLoaded", items: r.items, hasMore: r.hasMore, displaced });
         })
         .catch(() => {
           // Polling is best-effort; the next interval retries automatically.
@@ -1105,21 +950,16 @@ export function SessionsTab({ taskId, taskPaused = false }: { taskId: string; ta
     const all = [...intents, ...olderIntents];
     const minId = all.reduce((m, n) => Math.min(m, Number(n.id)), Infinity);
     if (!Number.isFinite(minId)) return;
-    setLoadingOlderIntents(true);
+    dispatch({ type: "workersChanged", patch: { loadingOlder: true } });
     api
       .intentsPage(taskId, minId, 300)
       .then((r) => {
-        setOlderIntents((prev) => {
-          const seen = new Set([...intents, ...prev].map((n) => n.id));
-          return [...prev, ...r.items.filter((n) => !seen.has(n.id))];
-        });
-        setOlderIntentsHasMore(r.hasMore);
-        setHasLoadedOlderIntentsPage(true);
+        dispatch({ type: "olderIntentsLoaded", items: r.items, hasMore: r.hasMore, knownIntents: intents });
       })
       .catch(() => {
         // A later manual retry can fetch this page again.
       })
-      .finally(() => setLoadingOlderIntents(false));
+      .finally(() => dispatch({ type: "workersChanged", patch: { loadingOlder: false } }));
   }, [taskId, intents, olderIntents, loadingOlderIntents]);
 
   // Combined, de-duplicated worker list (newest first page + older loaded pages).
@@ -1291,7 +1131,7 @@ export function SessionsTab({ taskId, taskPaused = false }: { taskId: string; ta
     if (!st || (!st.loaded && !st.loading)) {
       loadSession(activeKey);
     } else if (st.unread) {
-      patchStore(activeKey, (s) => ({ ...s, unread: 0 }));
+      dispatch({ type: "sessionRead", key: activeKey });
     }
   }, [activeKey]);
 
@@ -1303,12 +1143,9 @@ export function SessionsTab({ taskId, taskPaused = false }: { taskId: string; ta
   const mergeFocusPage = React.useCallback(
     (page: { items: Activity[]; hasMore: boolean }) => {
       if (!focusKey) return;
-      patchStore(focusKey, (s) => {
-        const items = mergeBySeq(page.items, s.items);
-        return { ...s, items, hasMore: page.hasMore, earliestSeq: items[0]?.seq ?? s.earliestSeq };
-      });
+      dispatch({ type: "focusPageMerged", key: focusKey, items: page.items, hasMore: page.hasMore });
     },
-    [focusKey, patchStore],
+    [focusKey],
   );
   const focusHistory = useApprovalHistory(
     approvalFocus.state?.source,
@@ -1484,63 +1321,58 @@ export function SessionsTab({ taskId, taskPaused = false }: { taskId: string; ta
 
   function stop() {
     if (stopping) return;
-    setStopping(true);
-    void api.stopChat(taskId).finally(() => setStopping(false));
+    dispatch({ type: "request/started", key: "stop" });
+    void api.stopChat(taskId).finally(() => dispatch({ type: "request/finished", key: "stop" }));
   }
 
   function send() {
     const text = input.trim();
     const atts = attachments;
-    if (side.handleCommand(text, () => setInput(""))) return;
+    if (side.handleCommand(text, () => dispatch({ type: "inputChanged", input: "" }))) return;
     if ((!text && atts.length === 0) || sending || mainBusy) return;
     // No optimistic echo: the backend persists+broadcasts the human turn before it
     // returns, so it streams back over SSE (worker="mainagent") with its real DB
     // seq — the transcript renders it from server data like every other step. Clear
     // the composer eagerly for responsiveness; restore it if the send fails.
-    setInput("");
-    setAttachments([]);
-    setSending(true);
+    dispatch({ type: "messageSendStarted" });
     chatStatusRequestRef.current++;
     api
       .chat(text, taskId, atts.length > 0 ? atts : undefined, active.seg ?? 0)
       .then(({ mode }) => {
         chatStatusRequestRef.current++;
-        setMainChatRunning(mode === "llm");
+        dispatch({ type: "mainChanged", patch: { chatRunning: mode === "llm" } });
       })
       .catch((e) => {
-        setInput(text); // restore so the user doesn't lose their text / attachments
-        setAttachments(atts);
+        dispatch({ type: "messageSendFailed", input: text, attachments: atts }); // restore so the user doesn't lose their text / attachments
         toast.error(t("Send failed: {error}", { error: (e as Error).message || t("please retry later") }));
       })
-      .finally(() => setSending(false));
+      .finally(() => dispatch({ type: "request/finished", key: "send" }));
   }
 
   function sendWorkerChat() {
     const intentId = active.intent_id;
     const message = workerMessage.trim();
-    if (side.handleCommand(message, () => setWorkerMessage(""))) return;
+    if (side.handleCommand(message, () => dispatch({ type: "workerSideQuestionSent" }))) return;
     if (!intentId || active.inherited || active.status !== "paused" || workerMessageSending || !message) return;
     if (workerMessageCharCount(message) > MAX_WORKER_MESSAGE_CHARS) {
       toast.error(t("Messages cannot exceed {count} characters", { count: MAX_WORKER_MESSAGE_CHARS }));
       return;
     }
     const requestId = workerMessageRequestId || newWorkerMessageRequestID();
-    if (!workerMessageRequestId) setWorkerMessageRequestId(requestId);
-    setWorkerMessageSending(true);
+    dispatch({ type: "workerMessageSendStarted", requestId });
     api
       .sendWorkerMessage(taskId, intentId, message, requestId)
       .then((result) => {
         // The server records the user turn and streams the run over SSE, so there is
         // no optimistic insert: the message and the continuation arrive live.
         patchIntentState(intentId, result.state);
-        setWorkerMessage("");
-        setWorkerMessageRequestId("");
+        dispatch({ type: "workerMessageSent" });
         toast.success(t("Message sent to Worker #{id}; execution resumed immediately", { id: intentId }));
       })
       .catch((error) => {
         toast.error(t("Send failed: {error}", { error: (error as Error).message || t("please retry later") }));
       })
-      .finally(() => setWorkerMessageSending(false));
+      .finally(() => dispatch({ type: "request/finished", key: "workerSend" }));
   }
 
   const mainLoaded = !!store[currentMainKey]?.loaded;
@@ -1576,7 +1408,7 @@ export function SessionsTab({ taskId, taskPaused = false }: { taskId: string; ta
             <div className="flex items-center justify-between gap-2">
               <button
                 type="button"
-                onClick={() => setListOpen((open) => !open)}
+                onClick={() => dispatch({ type: "sessionListToggled" })}
                 aria-expanded={listOpen}
                 aria-controls="session-list-panel"
                 className="flex min-w-0 flex-1 items-center gap-1 text-left text-xs font-medium text-muted-foreground lg:pointer-events-none"
@@ -1669,7 +1501,7 @@ export function SessionsTab({ taskId, taskPaused = false }: { taskId: string; ta
                       {role === "mainagent" && (
                         <button
                           type="button"
-                          onClick={() => setConfirmNewMain(true)}
+                          onClick={() => dispatch({ type: "mainChanged", patch: { confirmNew: true } })}
                           disabled={creatingMain}
                           title={t("New main agent session (clears context, task state preserved)")}
                           aria-label={t("New main agent session")}
@@ -1696,15 +1528,13 @@ export function SessionsTab({ taskId, taskPaused = false }: { taskId: string; ta
                           unread={store[keyForSession(s)]?.unread}
                           onClick={() => {
                             approvalFocus.close();
-                            setActiveId(s.id);
-                            setListOpen(false); // on mobile, collapse after picking to give the height back to the transcript
-                            setWorkerMessage("");
-                            setWorkerMessageRequestId("");
+                            // On mobile this also collapses the list to give the height back to the transcript.
+                            dispatch({ type: "sessionSelected", id: s.id });
                           }}
                           controlling={controllingIntent === s.intent_id}
                           deleted={meta?.deleted}
                           onCancel={() => {
-                            setCancelIntent(s);
+                            dispatch({ type: "workerControlChanged", patch: { cancelIntent: s } });
                           }}
                         />
                       );
@@ -1873,7 +1703,7 @@ export function SessionsTab({ taskId, taskPaused = false }: { taskId: string; ta
               focus={{
                 ...approvalFocus,
                 close: () => {
-                  setActiveId(activeId);
+                  dispatch({ type: "navChanged", patch: { selectedSessionId: activeId } });
                   approvalFocus.close();
                 },
               }}
@@ -1942,7 +1772,7 @@ export function SessionsTab({ taskId, taskPaused = false }: { taskId: string; ta
                         <button
                           type="button"
                           className="ml-0.5 text-muted-foreground hover:text-foreground"
-                          onClick={() => setAttachments((p) => p.filter((x) => x.path !== a.path))}
+                          onClick={() => dispatch({ type: "attachmentRemoved", path: a.path })}
                           title={t("Remove")}
                         >
                           <XIcon className="size-3" />
@@ -1970,7 +1800,7 @@ export function SessionsTab({ taskId, taskPaused = false }: { taskId: string; ta
                     }
                     value={input}
                     disabled={sending}
-                    onValueChange={setInput}
+                    onValueChange={(value) => dispatch({ type: "inputChanged", input: value })}
                     onKeyDown={(e) => {
                       if (!shouldSubmitOnKey(e, sendMode)) return;
                       e.preventDefault();
@@ -2035,10 +1865,7 @@ export function SessionsTab({ taskId, taskPaused = false }: { taskId: string; ta
                       id: active.intent_id ?? "",
                     })}
                     value={workerMessage}
-                    onValueChange={(value) => {
-                      setWorkerMessage(value);
-                      setWorkerMessageRequestId("");
-                    }}
+                    onValueChange={(value) => dispatch({ type: "workerMessageChanged", message: value })}
                     onKeyDown={(event) => {
                       if (!shouldSubmitOnKey(event, sendMode)) return;
                       event.preventDefault();
@@ -2128,9 +1955,7 @@ export function SessionsTab({ taskId, taskPaused = false }: { taskId: string; ta
           open={cancelIntent !== null}
           onOpenChange={(open) => {
             if (!open) {
-              setCancelIntent(null);
-              setCancelReason("");
-              setDeleteMode("soft");
+              dispatch({ type: "cancelDialogClosed" });
             }
           }}
         >
@@ -2157,7 +1982,7 @@ export function SessionsTab({ taskId, taskPaused = false }: { taskId: string; ta
               <div className="grid grid-cols-2 gap-2">
                 <button
                   type="button"
-                  onClick={() => setDeleteMode("soft")}
+                  onClick={() => dispatch({ type: "workerControlChanged", patch: { deleteMode: "soft" } })}
                   className={cn(
                     "rounded-md border px-3 py-2 text-left text-sm transition-colors",
                     deleteMode === "soft" ? "border-primary bg-primary/5" : "hover:bg-accent",
@@ -2168,7 +1993,7 @@ export function SessionsTab({ taskId, taskPaused = false }: { taskId: string; ta
                 </button>
                 <button
                   type="button"
-                  onClick={() => setDeleteMode("hard")}
+                  onClick={() => dispatch({ type: "workerControlChanged", patch: { deleteMode: "hard" } })}
                   className={cn(
                     "rounded-md border px-3 py-2 text-left text-sm transition-colors",
                     deleteMode === "hard" ? "border-destructive bg-destructive/5" : "hover:bg-accent",
@@ -2185,7 +2010,7 @@ export function SessionsTab({ taskId, taskPaused = false }: { taskId: string; ta
                 <Textarea
                   id="cancel-reason"
                   value={cancelReason}
-                  onChange={(e) => setCancelReason(e.target.value)}
+                  onChange={(e) => dispatch({ type: "workerControlChanged", patch: { cancelReason: e.target.value } })}
                   placeholder={t(
                     "Explain why this intent is being deleted, e.g. wrong direction / goal obsolete / duplicate of another intent…",
                   )}
@@ -2208,7 +2033,10 @@ export function SessionsTab({ taskId, taskPaused = false }: { taskId: string; ta
           </AlertDialogContent>
         </AlertDialog>
 
-        <AlertDialog open={confirmNewMain} onOpenChange={(open) => !open && setConfirmNewMain(false)}>
+        <AlertDialog
+          open={confirmNewMain}
+          onOpenChange={(open) => !open && dispatch({ type: "mainChanged", patch: { confirmNew: false } })}
+        >
           <AlertDialogContent className="max-w-[min(32rem,calc(100vw-2rem))]">
             <AlertDialogHeader>
               <AlertDialogTitle>{t("Start a new session?")}</AlertDialogTitle>

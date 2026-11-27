@@ -12,41 +12,35 @@ import { Input } from "@/components/ui/input";
 import { Skeleton } from "@/components/ui/skeleton";
 import { t } from "@/i18n";
 import { api } from "@/lib/api";
-import type { TaskCredential } from "@/lib/types";
 import { setVisibleInterval } from "@/lib/polling";
+
+import { credentialsTabReducer, initialCredentialsTabState } from "../_state/credentials-tab.reducer";
 
 // Credentials tab (#3): the task's test accounts — user-declared (program alias
 // accounts) and agent-recorded (accounts the workers registered themselves).
 // Passwords are masked server-side and never sent to the browser.
 export function CredentialsTab({ taskId }: { taskId: string }) {
-  const [items, setItems] = React.useState<TaskCredential[] | null>(null);
-  const [error, setError] = React.useState("");
-  const [domain, setDomain] = React.useState("");
-  const [username, setUsername] = React.useState("");
-  const [password, setPassword] = React.useState("");
-  const [note, setNote] = React.useState("");
-  const [adding, setAdding] = React.useState(false);
+  const [state, dispatch] = React.useReducer(credentialsTabReducer, initialCredentialsTabState);
+  const { items, error, form } = state;
+  const adding = state.requests.add.pending;
+  const { domain, username, password, note } = form;
 
   const load = React.useCallback(() => {
     api
       .taskCredentials(taskId)
-      .then((r) => {
-        setItems(r);
-        setError("");
-      })
-      .catch((e) => setError((e as Error).message));
+      .then((r) => dispatch({ type: "listLoaded", items: r }))
+      .catch((e) => dispatch({ type: "failed", error: (e as Error).message }));
   }, [taskId]);
 
   React.useEffect(() => {
     load();
     // Agent runs can record credentials mid-task; a light poll keeps the tab current.
-    const stopPolling = setVisibleInterval(load, 15000);
-    return stopPolling;
+    return setVisibleInterval(load, 15000);
   }, [load]);
 
   async function add() {
     if (!domain.trim() || !username.trim()) return;
-    setAdding(true);
+    dispatch({ type: "request/started", key: "add" });
     try {
       await api.addTaskCredential(taskId, {
         domain: domain.trim(),
@@ -54,15 +48,12 @@ export function CredentialsTab({ taskId }: { taskId: string }) {
         password, // empty = "agent generates and records it"
         note: note.trim(),
       });
-      setDomain("");
-      setUsername("");
-      setPassword("");
-      setNote("");
+      dispatch({ type: "credentialAdded" });
       load();
     } catch (e) {
-      setError((e as Error).message);
+      dispatch({ type: "failed", error: (e as Error).message });
     } finally {
-      setAdding(false);
+      dispatch({ type: "request/finished", key: "add" });
     }
   }
 
@@ -71,7 +62,7 @@ export function CredentialsTab({ taskId }: { taskId: string }) {
       await api.deleteTaskCredential(taskId, id);
       load();
     } catch (e) {
-      setError((e as Error).message);
+      dispatch({ type: "failed", error: (e as Error).message });
     }
   }
 
@@ -119,18 +110,31 @@ export function CredentialsTab({ taskId }: { taskId: string }) {
           </div>
         )}
         <div className="grid gap-2 sm:grid-cols-[1fr_1fr_1fr_auto]">
-          <Input placeholder={t("domain (e.g. target.example.com)")} value={domain} onChange={(e) => setDomain(e.target.value)} />
-          <Input placeholder={t("email or username")} value={username} onChange={(e) => setUsername(e.target.value)} />
+          <Input
+            placeholder={t("domain (e.g. target.example.com)")}
+            value={domain}
+            onChange={(e) => dispatch({ type: "formFieldChanged", patch: { domain: e.target.value } })}
+          />
+          <Input
+            placeholder={t("email or username")}
+            value={username}
+            onChange={(e) => dispatch({ type: "formFieldChanged", patch: { username: e.target.value } })}
+          />
           <Input
             placeholder={t("password (empty = agent generates)")}
             type="text"
             value={password}
-            onChange={(e) => setPassword(e.target.value)}
+            onChange={(e) => dispatch({ type: "formFieldChanged", patch: { password: e.target.value } })}
           />
           <Button variant="outline" disabled={adding || !domain.trim() || !username.trim()} onClick={add}>
             <PlusIcon /> {t("Add")}
           </Button>
-          <Input className="sm:col-span-4" placeholder={t("note (optional, e.g. program alias account)")} value={note} onChange={(e) => setNote(e.target.value)} />
+          <Input
+            className="sm:col-span-4"
+            placeholder={t("note (optional, e.g. program alias account)")}
+            value={note}
+            onChange={(e) => dispatch({ type: "formFieldChanged", patch: { note: e.target.value } })}
+          />
         </div>
       </CardContent>
     </Card>

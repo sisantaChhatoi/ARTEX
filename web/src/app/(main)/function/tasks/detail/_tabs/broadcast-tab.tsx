@@ -36,6 +36,12 @@ import { cn } from "@/lib/utils";
 import { setVisibleInterval } from "@/lib/polling";
 import { intlLocale, t } from "@/i18n";
 
+import {
+  type BroadcastFeedContent,
+  broadcastTabReducer,
+  initialBroadcastTabState,
+} from "../_state/broadcast-tab.reducer";
+
 const PAGE_SIZES = [20, 50, 100];
 const POLL_MS = 8000;
 
@@ -436,23 +442,11 @@ function BroadcastRow({
 }
 
 export function BroadcastTab({ taskId }: { taskId: string }) {
-  const [kinds, setKinds] = React.useState<ExploreKind[]>([]);
-  const [queryInput, setQueryInput] = React.useState("");
-  const [query, setQuery] = React.useState("");
-  const [order, setOrder] = React.useState<"asc" | "desc">("desc");
-  const [page, setPage] = React.useState(1);
-  const [size, setSize] = React.useState(20);
-  const [live, setLive] = React.useState(true);
-
-  const [items, setItems] = React.useState<TaskNode[]>([]);
-  const [edges, setEdges] = React.useState<Edge[]>([]);
-  const [refs, setRefs] = React.useState<Record<string, TaskNode>>({});
-  const [assets, setAssets] = React.useState<Record<string, FindingAsset[]>>({});
-  const [total, setTotal] = React.useState(0);
-  const [loaded, setLoaded] = React.useState(false);
-  const [freshIDs, setFreshIDs] = React.useState<Set<string>>(new Set());
-  const [pending, setPending] = React.useState(0);
-  const [now, setNow] = React.useState(0);
+  const [state, dispatch] = React.useReducer(broadcastTabReducer, initialBroadcastTabState);
+  const { filters, pagination, live, feed, now } = state;
+  const { kinds, queryInput, query, order } = filters;
+  const { page, size } = pagination;
+  const { items, edges, refs, assets, total, loaded, freshIDs, pending } = feed;
 
   const seenRef = React.useRef<Set<string>>(new Set());
   const baselineRef = React.useRef<number | null>(null);
@@ -462,17 +456,15 @@ export function BroadcastTab({ taskId }: { taskId: string }) {
   const atLive = page === 1 && order === "desc";
 
   React.useEffect(() => {
-    setNow(Date.now());
-    const t = setInterval(() => setNow(Date.now()), 30000);
+    dispatch({ type: "ticked", now: Date.now() });
+    const t = setInterval(() => dispatch({ type: "ticked", now: Date.now() }), 30000);
     return () => clearInterval(t);
   }, []);
 
   // Input debounce: the query fires 300ms after typing stops, and returns to page 1.
+  // biome-ignore lint/correctness/useExhaustiveDependencies: the reducer reads the latest input; re-arm on every keystroke.
   React.useEffect(() => {
-    const t = setTimeout(() => {
-      setQuery(queryInput);
-      setPage(1);
-    }, 300);
+    const t = setTimeout(() => dispatch({ type: "queryDebounced" }), 300);
     return () => clearTimeout(t);
   }, [queryInput]);
 
@@ -486,7 +478,7 @@ export function BroadcastTab({ taskId }: { taskId: string }) {
       streamRef.current = stream;
       seenRef.current = new Set();
       baselineRef.current = null;
-      setPending(0);
+      dispatch({ type: "streamReset" });
     }
     const load = () =>
       api
@@ -494,25 +486,24 @@ export function BroadcastTab({ taskId }: { taskId: string }) {
         .then((r) => {
           if (!alive) return;
           // The live seat refreshes every round; other positions render only the first time, then polls just update the unread count.
+          let content: BroadcastFeedContent | null = null;
           if (atLive || !rendered) {
             rendered = true;
-            setItems(r.items);
-            setEdges(r.edges);
-            setRefs(r.refs);
-            setAssets(r.assets);
+            content = { items: r.items, edges: r.edges, refs: r.refs, assets: r.assets };
           }
-          setTotal(r.total);
+          let freshIDs: Set<string> | null = null;
+          let pending: number;
           if (atLive) {
             const seen = seenRef.current;
-            setFreshIDs(seen.size === 0 ? new Set() : new Set(r.items.filter((n) => !seen.has(n.id)).map((n) => n.id)));
+            freshIDs = seen.size === 0 ? new Set() : new Set(r.items.filter((n) => !seen.has(n.id)).map((n) => n.id));
             seenRef.current = new Set(r.items.map((n) => n.id));
             baselineRef.current = r.total;
-            setPending(0);
+            pending = 0;
           } else {
             const base = baselineRef.current;
-            setPending(base === null ? 0 : Math.max(0, r.total - base));
+            pending = base === null ? 0 : Math.max(0, r.total - base);
           }
-          setLoaded(true);
+          dispatch({ type: "feedLoaded", total: r.total, content, freshIDs, pending });
         })
         .catch(() => {
           // Polling is best-effort: keep the last successful broadcast content and retry automatically next round.
@@ -531,14 +522,11 @@ export function BroadcastTab({ taskId }: { taskId: string }) {
   }, [taskId, page, size, kinds, query, order, live, atLive]);
 
   const toggleKind = (kind: ExploreKind) => {
-    setKinds((cur) => (cur.includes(kind) ? cur.filter((k) => k !== kind) : [...cur, kind]));
-    setPage(1);
+    dispatch({ type: "kindToggled", kind });
   };
 
   const backToLive = () => {
-    setPage(1);
-    setOrder("desc");
-    setPending(0);
+    dispatch({ type: "backToLive" });
   };
 
   // Server-side refs only fill in "neighbors not on this page"; references between same-page nodes must fall back to items,
@@ -555,7 +543,7 @@ export function BroadcastTab({ taskId }: { taskId: string }) {
 
   // When switching tasks or filters shrinks the count, pull the page number back in bounds.
   React.useEffect(() => {
-    if (page > pageCount) setPage(pageCount);
+    if (page > pageCount) dispatch({ type: "pageClamped", pageCount });
   }, [page, pageCount]);
 
   // Group by day: the stream breaks at date boundaries, so paging a long task still shows which day things happened.
@@ -576,7 +564,7 @@ export function BroadcastTab({ taskId }: { taskId: string }) {
           <SearchIcon className="absolute top-1/2 left-2.5 size-3.5 -translate-y-1/2 text-muted-foreground" />
           <Input
             value={queryInput}
-            onChange={(e) => setQueryInput(e.target.value)}
+            onChange={(e) => dispatch({ type: "queryInputChanged", queryInput: e.target.value })}
             placeholder={t("Search content / source / node id")}
             className="h-8 pl-8"
             aria-label={t("Search broadcasts")}
@@ -607,8 +595,7 @@ export function BroadcastTab({ taskId }: { taskId: string }) {
               size="sm"
               className="h-7 px-2 text-xs"
               onClick={() => {
-                setKinds([]);
-                setPage(1);
+                dispatch({ type: "kindsCleared" });
               }}
             >
               {t("Clear")}
@@ -621,8 +608,7 @@ export function BroadcastTab({ taskId }: { taskId: string }) {
             size="sm"
             className="h-8"
             onClick={() => {
-              setOrder((o) => (o === "desc" ? "asc" : "desc"));
-              setPage(1);
+              dispatch({ type: "orderToggled" });
             }}
             aria-label={
               order === "desc"
@@ -637,7 +623,7 @@ export function BroadcastTab({ taskId }: { taskId: string }) {
             variant={live ? "outline" : "secondary"}
             size="sm"
             className="h-8"
-            onClick={() => setLive((v) => !v)}
+            onClick={() => dispatch({ type: "liveToggled" })}
             aria-label={live ? t("Pause auto-refresh") : t("Resume auto-refresh")}
           >
             {live ? <PauseIcon /> : <PlayIcon />}
@@ -695,8 +681,7 @@ export function BroadcastTab({ taskId }: { taskId: string }) {
         <Select
           value={String(size)}
           onValueChange={(v) => {
-            setSize(Number(v));
-            setPage(1);
+            dispatch({ type: "pagination/sizeChanged", size: Number(v) });
           }}
         >
           <SelectTrigger size="sm" className="h-7 w-24">
@@ -720,7 +705,7 @@ export function BroadcastTab({ taskId }: { taskId: string }) {
             variant="outline"
             size="icon-sm"
             disabled={page <= 1}
-            onClick={() => setPage((p) => Math.max(1, p - 1))}
+            onClick={() => dispatch({ type: "previousPage" })}
             aria-label={t("Previous page")}
           >
             <ChevronLeftIcon />
@@ -732,7 +717,7 @@ export function BroadcastTab({ taskId }: { taskId: string }) {
             variant="outline"
             size="icon-sm"
             disabled={page >= pageCount}
-            onClick={() => setPage((p) => Math.min(pageCount, p + 1))}
+            onClick={() => dispatch({ type: "nextPage", pageCount })}
             aria-label={t("Next page")}
           >
             <ChevronRightIcon />

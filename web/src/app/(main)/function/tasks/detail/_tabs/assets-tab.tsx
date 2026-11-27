@@ -48,6 +48,8 @@ import { cn } from "@/lib/utils";
 import { setVisibleInterval } from "@/lib/polling";
 import { t } from "@/i18n";
 
+import { assetsTabReducer, initialAssetsTabState } from "../_state/assets-tab.reducer";
+
 const PAGE_SIZES = [25, 50, 100, 200];
 
 const METHOD_COLOR: Record<string, string> = {
@@ -343,40 +345,20 @@ function AddTaskAssetsSheet({
 }
 
 export function AssetsTab({ taskId }: { taskId: string }) {
-  const [rows, setRows] = React.useState<Asset[]>([]);
-  const [total, setTotal] = React.useState(0);
-  const [counts, setCounts] = React.useState<Record<string, number>>({});
-  const [loaded, setLoaded] = React.useState(false);
-  const [tab, setTab] = React.useState<NewAssetType>("root_domain");
-  const [page, setPage] = React.useState(0);
-  const [size, setSize] = React.useState(50);
-  const [query, setQuery] = React.useState("");
-  const [loading, setLoading] = React.useState(false);
-  const [dslError, setDslError] = React.useState("");
-  const [refreshKey, setRefreshKey] = React.useState(0);
-  const [addOpen, setAddOpen] = React.useState(false);
-  const [removeTarget, setRemoveTarget] = React.useState<Asset | null>(null);
-  const [removing, setRemoving] = React.useState(false);
+  const [state, dispatch] = React.useReducer(assetsTabReducer, initialAssetsTabState);
+  const { filters, pagination, list, listMeta, dialogs } = state;
+  const { tab, query } = filters;
+  const { page, size } = pagination;
+  const { items: rows, total, loaded, loading } = list;
+  const { counts, dslError, refreshKey } = listMeta;
+  const { addOpen, removeTarget } = dialogs;
+  const removing = state.requests.remove.pending;
   const assetsRequestRef = React.useRef(0);
   const dslMode = query.trim() !== "";
 
-  React.useEffect(() => {
-    setPage(0);
-    setRows([]);
-    setLoaded(false);
-  }, []);
-
   // Switching type tabs resets the search (DSL fields differ per type; matches
-  // the global asset view).
-  // biome-ignore lint/correctness/useExhaustiveDependencies: tab changes intentionally reset tab-local controls.
-  React.useEffect(() => {
-    setQuery("");
-    setDslError("");
-  }, [tab]);
-
-  // Query / tab / page-size changes restart server pagination.
-  // biome-ignore lint/correctness/useExhaustiveDependencies: these controls intentionally reset server pagination.
-  React.useEffect(() => setPage(0), [tab, size, query]);
+  // the global asset view), and query / tab / page-size changes restart server
+  // pagination. Both resets happen inside the reducer.
 
   // biome-ignore lint/correctness/useExhaustiveDependencies: refreshKey is an explicit manual-reload trigger.
   React.useEffect(() => {
@@ -384,7 +366,7 @@ export function AssetsTab({ taskId }: { taskId: string }) {
     const dsl = query.trim();
     const request = ++assetsRequestRef.current;
     const load = async () => {
-      setLoading(true);
+      dispatch({ type: "list/loadStarted" });
       try {
         // The search always stays within this task's assets: taskAssets and
         // searchTaskAssets both pin task_id server-side.
@@ -395,24 +377,18 @@ export function AssetsTab({ taskId }: { taskId: string }) {
           api.assetCounts(taskId),
         ]);
         if (!active || assetsRequestRef.current !== request) return;
-        setRows(current.assets);
-        setTotal(current.total);
-        setCounts(nextCounts ?? {});
-        setDslError("");
+        dispatch({ type: "assetsLoaded", rows: current.assets, total: current.total, counts: nextCounts ?? {} });
       } catch (reason) {
         if (!active || assetsRequestRef.current !== request) return;
         const message = String((reason as Error)?.message ?? reason);
         if (dsl) {
-          setDslError(message);
-          setRows([]);
-          setTotal(0);
+          dispatch({ type: "searchFailed", error: message });
         } else {
           toast.error(t("Failed to load task assets: {error}", { error: message }));
         }
       } finally {
         if (active && assetsRequestRef.current === request) {
-          setLoading(false);
-          setLoaded(true);
+          dispatch({ type: "list/loadFinished" });
         }
       }
     };
@@ -428,26 +404,25 @@ export function AssetsTab({ taskId }: { taskId: string }) {
 
   React.useEffect(() => {
     const maxPage = Math.max(0, Math.ceil(total / size) - 1);
-    if (page > maxPage) setPage(maxPage);
+    if (page > maxPage) dispatch({ type: "pagination/pageChanged", page: maxPage });
   }, [page, size, total]);
 
   const refresh = React.useCallback(() => {
-    setLoaded(false);
-    setRefreshKey((current) => current + 1);
+    dispatch({ type: "refreshRequested" });
   }, []);
 
   const remove = async () => {
     if (!removeTarget) return;
-    setRemoving(true);
+    dispatch({ type: "request/started", key: "remove" });
     try {
       await api.detachTaskAsset(taskId, removeTarget.id);
       toast.success(t("Removed {label} from the current task", { label: assetLabel(removeTarget) }));
-      setRemoveTarget(null);
+      dispatch({ type: "dialogsChanged", patch: { removeTarget: null } });
       refresh();
     } catch (reason) {
       toast.error(t("Failed to remove: {error}", { error: String((reason as Error)?.message ?? reason) }));
     } finally {
-      setRemoving(false);
+      dispatch({ type: "request/finished", key: "remove" });
     }
   };
 
@@ -455,7 +430,7 @@ export function AssetsTab({ taskId }: { taskId: string }) {
     <Button
       variant="ghost"
       size="icon-sm"
-      onClick={() => setRemoveTarget(asset)}
+      onClick={() => dispatch({ type: "dialogsChanged", patch: { removeTarget: asset } })}
       aria-label={t("Remove asset {label} from the task", { label: assetLabel(asset) })}
       title={t("Remove from task")}
     >
@@ -463,13 +438,20 @@ export function AssetsTab({ taskId }: { taskId: string }) {
     </Button>
   );
 
-  const commonCardProps = { loaded, onPage: setPage, onSize: setSize, page, size, total };
+  const commonCardProps = {
+    loaded,
+    onPage: (next: number) => dispatch({ type: "pagination/pageChanged", page: next }),
+    onSize: (next: number) => dispatch({ type: "pagination/sizeChanged", size: next }),
+    page,
+    size,
+    total,
+  };
   const totalAll = TABS.reduce((sum, item) => sum + (counts[item.key] ?? 0), 0);
 
   const searchBox = (
     <AssetDslSearch
       query={query}
-      onChange={setQuery}
+      onChange={(next) => dispatch({ type: "queryChanged", query: next })}
       loading={loading}
       error={dslError}
       count={dslMode ? total : undefined}
@@ -485,7 +467,7 @@ export function AssetsTab({ taskId }: { taskId: string }) {
             {t("This task is linked to {count} assets in total", { count: totalAll })}
           </p>
         </div>
-        <Button size="sm" onClick={() => setAddOpen(true)}>
+        <Button size="sm" onClick={() => dispatch({ type: "dialogsChanged", patch: { addOpen: true } })}>
           <PlusIcon data-icon="inline-start" />
           {t("Add test assets")}
         </Button>
@@ -493,7 +475,7 @@ export function AssetsTab({ taskId }: { taskId: string }) {
 
       <Tabs
         value={tab}
-        onValueChange={(value) => setTab(value as NewAssetType)}
+        onValueChange={(value) => dispatch({ type: "tabChanged", tab: value as NewAssetType })}
         className="flex min-h-0 flex-1 flex-col gap-2"
       >
         <div className="overflow-x-auto overflow-y-hidden">
@@ -703,9 +685,19 @@ export function AssetsTab({ taskId }: { taskId: string }) {
         </TabsContent>
       </Tabs>
 
-      <AddTaskAssetsSheet onAttached={refresh} onOpenChange={setAddOpen} open={addOpen} taskId={taskId} />
+      <AddTaskAssetsSheet
+        onAttached={refresh}
+        onOpenChange={(open) => dispatch({ type: "dialogsChanged", patch: { addOpen: open } })}
+        open={addOpen}
+        taskId={taskId}
+      />
 
-      <AlertDialog open={Boolean(removeTarget)} onOpenChange={(open) => !open && !removing && setRemoveTarget(null)}>
+      <AlertDialog
+        open={Boolean(removeTarget)}
+        onOpenChange={(open) =>
+          !open && !removing && dispatch({ type: "dialogsChanged", patch: { removeTarget: null } })
+        }
+      >
         <AlertDialogContent>
           <AlertDialogHeader>
             <AlertDialogTitle>{t("Remove from this task?")}</AlertDialogTitle>

@@ -53,6 +53,9 @@ import { RetestsTab } from "./_tabs/retests-tab";
 import { SessionsTab } from "./_tabs/sessions-tab";
 import { setVisibleInterval } from "@/lib/polling";
 
+import { initialTaskDetailState, taskDetailReducer } from "./_state/task-detail.reducer";
+import { initTaskLLMControlState, type TaskLLMDraft, taskLLMControlReducer } from "./_state/task-llm-control.reducer";
+
 const TABS = [
   { value: "sessions", label: t("Sessions") },
   { value: "overview", label: t("Overview") },
@@ -74,14 +77,22 @@ function taskProfileIDs(task: Task): string[] {
   return task.llm_profile_id ? [String(task.llm_profile_id)] : [];
 }
 
+function taskLLMDraft(task: Task): TaskLLMDraft {
+  const profileIDs = taskProfileIDs(task);
+  return {
+    profileIDs,
+    rotate: task.llm_rotate ?? false,
+    activeProfileID: task.active_llm_profile_id ? String(task.active_llm_profile_id) : (profileIDs[0] ?? ""),
+  };
+}
+
 function TaskLLMControl({ task, profiles, onUpdated }: { task: Task; profiles: LLMProfile[]; onUpdated: () => void }) {
-  const [open, setOpen] = React.useState(false);
-  const [profileIDs, setProfileIDs] = React.useState<string[]>(() => taskProfileIDs(task));
-  const [llmRotate, setLLMRotate] = React.useState(task.llm_rotate ?? false);
-  const [activeProfileID, setActiveProfileID] = React.useState(
-    task.active_llm_profile_id ? String(task.active_llm_profile_id) : (taskProfileIDs(task)[0] ?? ""),
+  const [state, dispatch] = React.useReducer(taskLLMControlReducer, task, (initialTask) =>
+    initTaskLLMControlState(taskLLMDraft(initialTask)),
   );
-  const [saving, setSaving] = React.useState(false);
+  const { open } = state;
+  const saving = state.requests.save.pending;
+  const { profileIDs, rotate: llmRotate, activeProfileID } = state.draft;
   const popoverContentRef = React.useRef<HTMLDivElement>(null);
 
   const chain = taskProfileIDs(task);
@@ -115,24 +126,20 @@ function TaskLLMControl({ task, profiles, onUpdated }: { task: Task; profiles: L
   if (saving) saveLabel = t("Saving");
 
   const syncDraft = React.useCallback(() => {
-    const next = taskProfileIDs(task);
-    setLLMRotate(task.llm_rotate ?? false);
-    setProfileIDs(next);
-    setActiveProfileID(task.active_llm_profile_id ? String(task.active_llm_profile_id) : (next[0] ?? ""));
+    dispatch({ type: "draftReset", draft: taskLLMDraft(task) });
   }, [task]);
 
   const handleOpenChange = (next: boolean) => {
-    setOpen(next);
+    dispatch({ type: "openChanged", open: next });
     if (next) syncDraft();
   };
 
   const handleProfileIDsChange = (next: string[]) => {
-    setProfileIDs(next);
-    setActiveProfileID((current) => (next.includes(current) ? current : (next[0] ?? "")));
+    dispatch({ type: "profileIDsChanged", profileIDs: next });
   };
 
   const save = async () => {
-    setSaving(true);
+    dispatch({ type: "request/started", key: "save" });
     try {
       const result = await api.updateTaskLLMProfiles(
         task.id,
@@ -149,12 +156,12 @@ function TaskLLMControl({ task, profiles, onUpdated }: { task: Task; profiles: L
             : t("LLM configs updated"),
         );
       }
-      setOpen(false);
+      dispatch({ type: "openChanged", open: false });
       onUpdated();
     } catch (error) {
       toast.error(t("Update failed: {error}", { error: (error as Error).message }));
     } finally {
-      setSaving(false);
+      dispatch({ type: "request/finished", key: "save" });
     }
   };
 
@@ -195,17 +202,22 @@ function TaskLLMControl({ task, profiles, onUpdated }: { task: Task; profiles: L
           profiles={profiles}
           value={profileIDs}
           rotate={llmRotate}
-          onRotateChange={setLLMRotate}
+          onRotateChange={(rotate) => dispatch({ type: "rotateChanged", rotate })}
           onValueChange={handleProfileIDsChange}
           activeProfileId={activeProfileID}
-          onActiveProfileChange={setActiveProfileID}
+          onActiveProfileChange={(next) => dispatch({ type: "activeProfileChanged", activeProfileID: next })}
           inputId="task-llm-profiles"
           disabled={saving}
           portalContainer={popoverContentRef}
         />
 
         <div className="flex justify-end gap-2">
-          <Button type="button" variant="outline" size="sm" onClick={() => setOpen(false)}>
+          <Button
+            type="button"
+            variant="outline"
+            size="sm"
+            onClick={() => dispatch({ type: "openChanged", open: false })}
+          >
             {t("Close")}
           </Button>
           <Button type="button" size="sm" onClick={save} disabled={saving}>
@@ -222,19 +234,16 @@ function TaskDetailInner() {
   const router = useRouter();
   const searchParams = useSearchParams();
   const id = searchParams.get("id") ?? "";
-  const [task, setTask] = React.useState<Task | null>(null);
-  const [paused, setPaused] = React.useState(false);
-  const [loaded, setLoaded] = React.useState(false);
-  const [tab, setTab] = React.useState("sessions");
-  const [interceptPendingCount, setInterceptPendingCount] = React.useState(0);
-  const [profiles, setProfiles] = React.useState<LLMProfile[]>([]);
-  const [archiving, setArchiving] = React.useState(false);
+  const [state, dispatch] = React.useReducer(taskDetailReducer, initialTaskDetailState);
+  const { task, paused, loaded } = state.detail;
+  const { tab, interceptPendingCount, profiles } = state;
+  const archiving = state.requests.archive.pending;
 
   React.useEffect(() => {
     api
       .llmProfiles()
-      .then(setProfiles)
-      .catch(() => setProfiles([]));
+      .then((items) => dispatch({ type: "profilesLoaded", profiles: items }))
+      .catch(() => dispatch({ type: "profilesLoaded", profiles: [] }));
   }, []);
 
   React.useEffect(() => {
@@ -243,7 +252,8 @@ function TaskDetailInner() {
       api
         .interceptTask(id)
         .then((rows) => {
-          if (alive) setInterceptPendingCount(rows.filter((r) => r.status === "pending").length);
+          if (alive)
+            dispatch({ type: "interceptPendingCounted", count: rows.filter((r) => r.status === "pending").length });
         })
         .catch(() => {
           // Polling is best-effort; the next interval retries automatically.
@@ -272,8 +282,7 @@ function TaskDetailInner() {
           base.engine_mode = s?.engine_mode ?? at.engine_mode;
           base.paused = at.paused;
         }
-        setTask(base);
-        setPaused(at?.paused ?? base.paused ?? false);
+        dispatch({ type: "detailChanged", patch: { task: base, paused: at?.paused ?? base.paused ?? false } });
       })
       .catch(() => {
         // Keep the last rendered task state during a transient poll failure.
@@ -281,7 +290,7 @@ function TaskDetailInner() {
       .finally(() => {
         if (taskLoadInFlight.current === id) {
           taskLoadInFlight.current = null;
-          setLoaded(true);
+          dispatch({ type: "detailChanged", patch: { loaded: true } });
         }
       });
   }, [id]);
@@ -296,7 +305,7 @@ function TaskDetailInner() {
     const next = !paused;
     try {
       await api.controlTask(id, next ? "pause" : "resume");
-      setPaused(next);
+      dispatch({ type: "detailChanged", patch: { paused: next } });
       toast.success(next ? t("Exploration paused") : t("Exploration resumed"));
     } catch (e) {
       toast.error(t("Operation failed: {error}", { error: (e as Error).message }));
@@ -305,14 +314,14 @@ function TaskDetailInner() {
 
   async function archiveTask() {
     if (!task || archiving) return;
-    setArchiving(true);
+    dispatch({ type: "request/started", key: "archive" });
     try {
       await api.archiveTask(task.id);
       toast.success(t("Task queued for archiving"));
       router.push("/function/tasks");
     } catch (error) {
       toast.error(t("Archive failed: {error}", { error: (error as Error).message }));
-      setArchiving(false);
+      dispatch({ type: "request/finished", key: "archive" });
     }
   }
 
@@ -367,7 +376,11 @@ function TaskDetailInner() {
   );
 
   return (
-    <Tabs value={tab} onValueChange={setTab} className="flex flex-1 flex-col gap-0">
+    <Tabs
+      value={tab}
+      onValueChange={(next) => dispatch({ type: "tabChanged", tab: next })}
+      className="flex flex-1 flex-col gap-0"
+    >
       {/* Top fixed area */}
       <header className="sticky top-0 z-10 flex flex-col gap-2 border-b bg-background/95 px-4 py-2.5 backdrop-blur lg:px-6">
         <div className="flex items-center gap-2">

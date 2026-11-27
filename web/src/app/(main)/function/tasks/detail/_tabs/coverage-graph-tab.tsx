@@ -30,6 +30,8 @@ import { statusMeta } from "@/lib/status";
 import type { CoverageAssetRef, CoverageAssetRefs, CoverageGraphEdge, CoverageGraphNode } from "@/lib/types";
 import { cn } from "@/lib/utils";
 
+import { coverageGraphReducer, initCoverageGraphState } from "../_state/coverage-graph.reducer";
+
 // Default number of children shown per kind under each parent; the rest fold away, and "Show more" pulls in this many each time.
 const FOLD_LIMIT = 20;
 const FOLD_STEP = 20;
@@ -465,14 +467,9 @@ function FoldSheet({
 
 // ---------------------------------------------------------------------------
 function GraphInner({ taskId, coverageEnabled = true }: { taskId: string; coverageEnabled?: boolean }) {
-  const [data, setData] = React.useState<{
-    nodes: CoverageGraphNode[];
-    edges: CoverageGraphEdge[];
-  } | null>(null);
-  const [expanded, setExpanded] = React.useState<Map<string, number>>(new Map());
-  const [selectedAsset, setSelectedAsset] = React.useState<CoverageGraphNode | null>(null);
-  const [selectedFoldId, setSelectedFoldId] = React.useState<string | null>(null);
-  const [loading, setLoading] = React.useState(true);
+  const [state, dispatch] = React.useReducer(coverageGraphReducer, undefined, initCoverageGraphState);
+  const { data, expanded, loading } = state;
+  const { asset: selectedAsset, foldId: selectedFoldId } = state.selection;
 
   const containerRef = React.useRef<HTMLDivElement>(null);
   const graphRef = React.useRef<G6Graph | null>(null);
@@ -484,19 +481,19 @@ function GraphInner({ taskId, coverageEnabled = true }: { taskId: string; covera
   });
 
   const fetchGraph = React.useCallback(() => {
-    setLoading(true);
+    dispatch({ type: "fetchStarted" });
     api
       .taskCoverageGraph(taskId)
       .then((g) => {
         // Asset coverage disabled (B1): the graph still renders (in-scope assets/company links remain visible), but
         // tested state is flattened away — no test progress and no tested highlight.
         const nodes = coverageEnabled ? (g.nodes ?? []) : (g.nodes ?? []).map((n) => ({ ...n, tested: false }));
-        setData({ nodes, edges: g.edges ?? [] });
+        dispatch({ type: "fetched", data: { nodes, edges: g.edges ?? [] } });
       })
       .catch(() => {
         /* keep the previous data */
       })
-      .finally(() => setLoading(false));
+      .finally(() => dispatch({ type: "fetchFinished" }));
   }, [taskId, coverageEnabled]);
 
   React.useEffect(() => {
@@ -598,8 +595,8 @@ function GraphInner({ taskId, coverageEnabled = true }: { taskId: string; covera
         if (!id) return;
         const rn = renderMapRef.current.get(id);
         if (!rn) return;
-        if (rn.fold) setSelectedFoldId(rn.key);
-        else setSelectedAsset(rn.node);
+        if (rn.fold) dispatch({ type: "foldSelected", foldId: rn.key });
+        else dispatch({ type: "assetSelected", asset: rn.node });
       });
       graphRef.current = graph;
       applyData();
@@ -624,11 +621,7 @@ function GraphInner({ taskId, coverageEnabled = true }: { taskId: string; covera
   }, [sig, applyData]);
 
   const showMore = React.useCallback((groupId: string) => {
-    setExpanded((prev) => {
-      const m = new Map(prev);
-      m.set(groupId, (m.get(groupId) ?? FOLD_LIMIT) + FOLD_STEP);
-      return m;
-    });
+    dispatch({ type: "foldExpanded", groupId, defaultShown: FOLD_LIMIT, step: FOLD_STEP });
   }, []);
 
   const selectedFold =
@@ -636,7 +629,7 @@ function GraphInner({ taskId, coverageEnabled = true }: { taskId: string; covera
       ? ((renderNodes.find((n) => n.fold && n.key === selectedFoldId) as FoldNode | undefined) ?? null)
       : null;
   React.useEffect(() => {
-    if (selectedFoldId != null && !selectedFold) setSelectedFoldId(null);
+    if (selectedFoldId != null && !selectedFold) dispatch({ type: "foldSelected", foldId: null });
   }, [selectedFoldId, selectedFold]);
 
   const total = data?.nodes.length ?? 0;
@@ -705,15 +698,16 @@ function GraphInner({ taskId, coverageEnabled = true }: { taskId: string; covera
         </p>
       </div>
 
-      <AssetSheet node={selectedAsset} taskId={taskId} onOpenChange={(o) => !o && setSelectedAsset(null)} />
+      <AssetSheet
+        node={selectedAsset}
+        taskId={taskId}
+        onOpenChange={(o) => !o && dispatch({ type: "assetSelected", asset: null })}
+      />
       <FoldSheet
         fold={selectedFold}
-        onOpenChange={(o) => !o && setSelectedFoldId(null)}
+        onOpenChange={(o) => !o && dispatch({ type: "foldSelected", foldId: null })}
         onShowMore={showMore}
-        onPick={(n) => {
-          setSelectedFoldId(null);
-          setSelectedAsset(n);
-        }}
+        onPick={(n) => dispatch({ type: "foldItemPicked", asset: n })}
       />
     </div>
   );

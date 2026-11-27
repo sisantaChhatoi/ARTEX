@@ -16,21 +16,20 @@ import { Separator } from "@/components/ui/separator";
 import { Skeleton } from "@/components/ui/skeleton";
 import { t } from "@/i18n";
 import { api } from "@/lib/api";
-import type { Finding, FindingsPage } from "@/lib/types";
+import type { Finding } from "@/lib/types";
 
-const PAGE_SIZE = 20;
+import { initialRetestsTabState, PAGE_SIZE, retestsTabReducer } from "../_state/retests-tab.reducer";
 
 function findingLabel(finding: Finding) {
   return finding.name?.trim() || finding.vulnclass.trim() || t("Uncategorized");
 }
 
 export function RetestsTab({ taskId }: { taskId: string }) {
-  const [page, setPage] = React.useState(1);
-  const [data, setData] = React.useState<FindingsPage | null>(null);
-  const [selectedId, setSelectedId] = React.useState("");
-  const [error, setError] = React.useState("");
-  const [refreshVersion, setRefreshVersion] = React.useState(0);
-  const refresh = React.useCallback(() => setRefreshVersion((version) => version + 1), []);
+  const [state, dispatch] = React.useReducer(retestsTabReducer, initialRetestsTabState);
+  const { selectedId, refreshVersion } = state;
+  const { page } = state.pagination;
+  const { data, error } = state.list;
+  const refresh = React.useCallback(() => dispatch({ type: "refreshRequested" }), []);
 
   // Only this task's own findings, including those without graph nodes.
   // Fetch history only for the selection, and wait for each poll to finish.
@@ -43,16 +42,12 @@ export function RetestsTab({ taskId }: { taskId: string }) {
         if (disposed) return;
         const lastPage = Math.max(1, Math.ceil(result.total / PAGE_SIZE));
         if (page > lastPage) {
-          setPage(lastPage);
+          dispatch({ type: "pagination/pageChanged", page: lastPage });
           return;
         }
-        setData(result);
-        setSelectedId((current) =>
-          result.items.some((finding) => finding.id === current) ? current : (result.items[0]?.id ?? ""),
-        );
-        setError("");
+        dispatch({ type: "pageLoaded", data: result });
       } catch (e) {
-        if (!disposed) setError((e as Error).message);
+        if (!disposed) dispatch({ type: "loadFailed", error: (e as Error).message });
       } finally {
         if (!disposed) timer = setTimeout(() => void load(), 3000);
       }
@@ -97,7 +92,7 @@ export function RetestsTab({ taskId }: { taskId: string }) {
                   className="h-auto w-full shrink-0 flex-col items-start gap-2 whitespace-normal py-3 text-left"
                   aria-label={t("Select vulnerability: {name}", { name: findingLabel(finding) })}
                   aria-pressed={finding.id === selectedId}
-                  onClick={() => setSelectedId(finding.id)}
+                  onClick={() => dispatch({ type: "findingSelected", id: finding.id })}
                 >
                   <span className="line-clamp-2 break-words">{findingLabel(finding)}</span>
                   <span className="flex flex-wrap items-center gap-2">
@@ -123,7 +118,7 @@ export function RetestsTab({ taskId }: { taskId: string }) {
                 size="icon-sm"
                 aria-label={t("Previous page of vulnerabilities")}
                 disabled={page === 1}
-                onClick={() => setPage(page - 1)}
+                onClick={() => dispatch({ type: "pagination/pageChanged", page: page - 1 })}
               >
                 <ChevronLeftIcon />
               </Button>
@@ -135,7 +130,7 @@ export function RetestsTab({ taskId }: { taskId: string }) {
                 size="icon-sm"
                 aria-label={t("Next page of vulnerabilities")}
                 disabled={page * PAGE_SIZE >= data.total}
-                onClick={() => setPage(page + 1)}
+                onClick={() => dispatch({ type: "pagination/pageChanged", page: page + 1 })}
               >
                 <ChevronRightIcon />
               </Button>
