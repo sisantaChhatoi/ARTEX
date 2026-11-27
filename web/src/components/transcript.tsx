@@ -18,6 +18,11 @@ import {
 import { toast } from "sonner";
 import { api } from "@/lib/api";
 import { intlLocale, t } from "@/i18n";
+import {
+  initialInterceptCardState,
+  type InterceptDecision,
+  interceptCardReducer,
+} from "@/components/_state/intercept-card.reducer";
 import { Markdown } from "@/components/markdown";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -25,7 +30,7 @@ import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/component
 import { ApprovalDetail } from "@/components/approval-records";
 import { reportsBashExit127 } from "@/lib/bash-exit-status";
 import { formatBytes } from "@/lib/format";
-import type { Activity, InterceptPending } from "@/lib/types";
+import type { Activity } from "@/lib/types";
 
 // ---- per-agent lane color (planner + work#1/#2/#3 …) ---------------------------
 const workerColors = [
@@ -205,13 +210,12 @@ function InterceptCard({
     return m ? m[1] : step.summary;
   }, [step.summary]);
 
-  const [detail, setDetail] = React.useState<Record<string, unknown> | null>(null);
-  const [decided, setDecided] = React.useState<"allowed" | "denied" | "timeout" | null>(null);
-  const [deciding, setDeciding] = React.useState(false);
-  const [expanded, setExpanded] = React.useState(false);
-  const [pending, setPending] = React.useState<InterceptPending | null>(null);
-  const [statusError, setStatusError] = React.useState("");
-  const [retry, setRetry] = React.useState(0);
+  const [state, dispatch] = React.useReducer(interceptCardReducer, initialInterceptCardState);
+  const { detail, expanded } = state;
+  const { pending, decided, statusError, retry } = state.approval;
+  const deciding = state.requests.decide.pending;
+  // Stable: ApprovalDetail reloads whenever onResolved changes.
+  const onResolved = React.useCallback((decision: InterceptDecision) => dispatch({ type: "decided", decision }), []);
 
   // Load persisted detail JSON + check the real current status from the backend
   // so that a page refresh shows the already-decided state instead of re-offering buttons.
@@ -220,7 +224,11 @@ function InterceptCard({
     getDetail(step.seq)
       .then((raw) => {
         if (!live || !raw) return;
-        try { setDetail(JSON.parse(raw)); } catch { /* ignore */ }
+        try {
+          dispatch({ type: "detailLoaded", detail: JSON.parse(raw) });
+        } catch {
+          /* ignore */
+        }
       })
       .catch(() => {/* ignore */});
     return () => { live = false; };
@@ -232,26 +240,29 @@ function InterceptCard({
     let live = true;
     api.interceptGetOne(pendingId)
       .then((p) => {
-        if (!live) return;
-        setPending(p);
-        setStatusError("");
-        if (p.status !== "pending") setDecided(p.status as "allowed" | "denied" | "timeout");
+        if (live) dispatch({ type: "approvalLoaded", pending: p });
       })
-      .catch((error) => { if (live) setStatusError((error as Error).message || t("Failed to load approval details")); });
+      .catch((error) => {
+        if (live)
+          dispatch({
+            type: "approvalLoadFailed",
+            error: (error as Error).message || t("Failed to load approval details"),
+          });
+      });
     return () => { live = false; };
   }, [pendingId, retry]);
 
   async function decide(decision: "allowed" | "denied") {
     if (step.inherited || !pendingId || deciding) return;
-    setDeciding(true);
+    dispatch({ type: "request/started", key: "decide" });
     try {
       await api.interceptDecide(pendingId, decision);
-      setDecided(decision);
+      dispatch({ type: "decided", decision });
       toast.success(decision === "allowed" ? t("Execution allowed") : t("Execution denied"));
     } catch (e) {
       toast.error((e as Error).message);
     } finally {
-      setDeciding(false);
+      dispatch({ type: "request/finished", key: "decide" });
     }
   }
 
@@ -320,7 +331,11 @@ function InterceptCard({
         )}
       </div>
       {pendingId ? (
-        <Collapsible open={expanded} onOpenChange={setExpanded} className="mt-2 min-w-0">
+        <Collapsible
+          open={expanded}
+          onOpenChange={(open) => dispatch({ type: "expandedChanged", expanded: open })}
+          className="mt-2 min-w-0"
+        >
           <CollapsibleTrigger asChild>
             <Button variant="ghost" size="sm" aria-label={expanded ? t("Collapse approval details") : t("Expand approval details")}
             >
@@ -337,12 +352,12 @@ function InterceptCard({
                 revision={retry}
                 readOnly={Boolean(step.inherited)}
                 defaultExpanded
-                onResolved={setDecided}
+                onResolved={onResolved}
               />
             ) : statusError ? (
               <div className="flex flex-wrap items-center gap-2 p-3" role="alert">
                 <span>{statusError}</span>
-                <Button variant="outline" size="sm" onClick={() => setRetry((value) => value + 1)}>
+                <Button variant="outline" size="sm" onClick={() => dispatch({ type: "retryRequested" })}>
                   {t("Retry details")}
                 </Button>
               </div>

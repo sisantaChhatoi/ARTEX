@@ -5,6 +5,10 @@ import * as React from "react";
 import { ArrowDownIcon, ArrowUpIcon, PlusIcon } from "lucide-react";
 import { toast } from "sonner";
 
+import {
+  findingTrafficPanelReducer,
+  initialFindingTrafficPanelState,
+} from "@/components/_state/finding-traffic-panel.reducer";
 import { TrafficEvidenceViewer } from "@/components/traffic-evidence-viewer";
 import { TrafficPickerDialog } from "@/components/traffic-picker-dialog";
 import { Alert, AlertDescription } from "@/components/ui/alert";
@@ -25,7 +29,7 @@ import { Select, SelectContent, SelectGroup, SelectItem, SelectTrigger, SelectVa
 import { Skeleton } from "@/components/ui/skeleton";
 import { Textarea } from "@/components/ui/textarea";
 import { api } from "@/lib/api";
-import type { FindingTraffic, FindingTrafficBinding, TrafficEvidenceRole } from "@/lib/types";
+import type { FindingTraffic, TrafficEvidenceRole } from "@/lib/types";
 import { intlLocale, t } from "@/i18n";
 
 const ROLES: Record<TrafficEvidenceRole, string> = {
@@ -46,45 +50,39 @@ export function FindingTrafficPanel({
   readOnly?: boolean;
   onChanged: () => void;
 }) {
-  const [data, setData] = React.useState<FindingTraffic | null>(null);
-  const [error, setError] = React.useState("");
-  const [adding, setAdding] = React.useState(false);
-  const [preview, setPreview] = React.useState<string | null>(null);
-  const [editing, setEditing] = React.useState<FindingTrafficBinding | null>(null);
-  const [role, setRole] = React.useState<TrafficEvidenceRole>("supporting");
-  const [note, setNote] = React.useState("");
-  const [busy, setBusy] = React.useState(false);
-  const [reload, setReload] = React.useState(0);
+  const [state, dispatch] = React.useReducer(findingTrafficPanelReducer, initialFindingTrafficPanelState);
+  const { data, error, reloadTick } = state.evidence;
+  const { binding: editing, role, note } = state.editor;
+  const { adding, preview } = state;
+  const busy = state.requests.mutate.pending;
   // biome-ignore lint/correctness/useExhaustiveDependencies: retry token intentionally refreshes this request.
   React.useEffect(() => {
     let active = true;
-    setData(null);
-    setError("");
+    dispatch({ type: "loadStarted" });
     api
       .findingTraffic(findingId, contextTask)
       .then((value) => {
-        if (active) setData(value);
+        if (active) dispatch({ type: "loaded", data: value });
       })
       .catch((e: Error) => {
-        if (active) setError(e.message);
+        if (active) dispatch({ type: "loadFailed", error: e.message });
       });
     return () => {
       active = false;
     };
-  }, [findingId, contextTask, reload]);
+  }, [findingId, contextTask, reloadTick]);
 
   async function mutate(action: () => Promise<FindingTraffic>) {
-    setBusy(true);
+    dispatch({ type: "request/started", key: "mutate" });
     try {
-      setData(await action());
-      setEditing(null);
+      dispatch({ type: "mutated", data: await action() });
       onChanged();
       toast.success(t("Traffic evidence updated"));
     } catch (e) {
       toast.error((e as Error).message);
-      setReload((n) => n + 1);
+      dispatch({ type: "reloadRequested" });
     } finally {
-      setBusy(false);
+      dispatch({ type: "request/finished", key: "mutate" });
     }
   }
 
@@ -102,7 +100,12 @@ export function FindingTrafficPanel({
           <div className="flex flex-wrap items-center justify-between gap-2">
             <CardTitle>{t("Linked traffic")} {data ? `(${data.bindings.length})` : ""}</CardTitle>
             {!readOnly ? (
-              <Button variant="outline" size="sm" disabled={!data || busy} onClick={() => setAdding(true)}>
+              <Button
+                variant="outline"
+                size="sm"
+                disabled={!data || busy}
+                onClick={() => dispatch({ type: "addingChanged", open: true })}
+              >
                 <PlusIcon data-icon="inline-start" />
                 {t("Link traffic")}
               </Button>
@@ -117,7 +120,7 @@ export function FindingTrafficPanel({
             <Alert variant="destructive">
               <AlertDescription>
                 {error}
-                <Button variant="link" onClick={() => setReload((n) => n + 1)}>
+                <Button variant="link" onClick={() => dispatch({ type: "reloadRequested" })}>
                   {t("Retry")}
                 </Button>
               </AlertDescription>
@@ -147,7 +150,7 @@ export function FindingTrafficPanel({
                 <Button
                   variant="link"
                   className="h-auto justify-start p-0 text-left whitespace-normal"
-                  onClick={() => setPreview(b.id)}
+                  onClick={() => dispatch({ type: "previewChanged", id: b.id })}
                 >
                   <span className="break-all font-mono text-xs">{b.snapshot.url}</span>
                 </Button>
@@ -157,7 +160,7 @@ export function FindingTrafficPanel({
                     {new Date(b.snapshot.captured_at * 1000).toLocaleString(intlLocale)}
                   </span>
                   <div className="flex flex-wrap gap-1">
-                    <Button variant="outline" size="sm" onClick={() => setPreview(b.id)}>
+                    <Button variant="outline" size="sm" onClick={() => dispatch({ type: "previewChanged", id: b.id })}>
                       {t("View message")}
                     </Button>
                     {!readOnly ? (
@@ -166,11 +169,7 @@ export function FindingTrafficPanel({
                           variant="ghost"
                           size="sm"
                           disabled={busy}
-                          onClick={() => {
-                            setEditing(b);
-                            setRole(b.role);
-                            setNote(b.note);
-                          }}
+                          onClick={() => dispatch({ type: "editStarted", binding: b })}
                         >
                           {t("Edit note")}
                         </Button>
@@ -216,9 +215,9 @@ export function FindingTrafficPanel({
           findingId={findingId}
           contextTask={contextTask}
           bound={data.bindings}
-          onClose={() => setAdding(false)}
+          onClose={() => dispatch({ type: "addingChanged", open: false })}
           onBound={() => {
-            setReload((n) => n + 1);
+            dispatch({ type: "reloadRequested" });
             onChanged();
           }}
         />
@@ -227,12 +226,12 @@ export function FindingTrafficPanel({
         findingId={findingId}
         bindingId={preview}
         contextTask={contextTask}
-        onClose={() => setPreview(null)}
+        onClose={() => dispatch({ type: "previewChanged", id: null })}
       />
       <Dialog
         open={editing !== null}
         onOpenChange={(open) => {
-          if (!open && !busy) setEditing(null);
+          if (!open && !busy) dispatch({ type: "editorChanged", patch: { binding: null } });
         }}
       >
         <DialogContent>
@@ -243,7 +242,10 @@ export function FindingTrafficPanel({
           <FieldGroup>
             <Field>
               <FieldLabel htmlFor="evidence-role">{t("Role")}</FieldLabel>
-              <Select value={role} onValueChange={(v) => setRole(v as TrafficEvidenceRole)}>
+              <Select
+                value={role}
+                onValueChange={(v) => dispatch({ type: "editorChanged", patch: { role: v as TrafficEvidenceRole } })}
+              >
                 <SelectTrigger id="evidence-role">
                   <SelectValue />
                 </SelectTrigger>
@@ -260,11 +262,19 @@ export function FindingTrafficPanel({
             </Field>
             <Field>
               <FieldLabel htmlFor="evidence-note">{t("Evidence note")}</FieldLabel>
-              <Textarea id="evidence-note" value={note} onChange={(e) => setNote(e.target.value)} />
+              <Textarea
+                id="evidence-note"
+                value={note}
+                onChange={(e) => dispatch({ type: "editorChanged", patch: { note: e.target.value } })}
+              />
             </Field>
           </FieldGroup>
           <DialogFooter>
-            <Button variant="outline" disabled={busy} onClick={() => setEditing(null)}>
+            <Button
+              variant="outline"
+              disabled={busy}
+              onClick={() => dispatch({ type: "editorChanged", patch: { binding: null } })}
+            >
               {t("Cancel")}
             </Button>
             <Button

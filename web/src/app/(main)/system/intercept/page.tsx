@@ -58,10 +58,11 @@ import type {
   InterceptRule,
   JudgeConfig,
   JudgeDayUsage,
-  JudgeUsage,
-  LLMProfile,
   Tool,
 } from "@/lib/types";
+
+import { initialInterceptPageState, interceptPageReducer, type RuleForm } from "./_state/intercept-page.reducer";
+import { initialJudgeCardState, judgeCardReducer } from "./_state/judge-card.reducer";
 
 // tRich translates a sentence whose {placeholders} are rendered as React nodes (e.g. emphasised spans or code).
 function tRich(key: string, nodes: Record<string, React.ReactNode>): React.ReactNode[] {
@@ -152,36 +153,6 @@ function groupTools(dbTools: Tool[]) {
   ].filter((g) => g.tools.length > 0);
 }
 
-// ---- form state ----
-
-type RuleForm = {
-  name: string;
-  enabled: boolean;
-  priority: number;
-  match_target: "tool_name" | "tool_input";
-  match_type: "string" | "regex" | "argv";
-  pattern: string;
-  action: InterceptAction;
-  message: string;
-  timeout_enabled: boolean;
-  timeout_seconds: number;
-  timeout_action: "deny" | "allow";
-};
-
-const defaultForm = (): RuleForm => ({
-  name: "",
-  enabled: true,
-  priority: 0,
-  match_target: "tool_name",
-  match_type: "string",
-  pattern: "",
-  action: "deny",
-  message: "",
-  timeout_enabled: true,
-  timeout_seconds: 60,
-  timeout_action: "deny",
-});
-
 // An argv pattern (JSON array of tokens) shown as a prefix: ["nmap"] -> "nmap *".
 function argvLabel(pattern: string): string {
   try {
@@ -216,43 +187,29 @@ function Field({ label, children }: { label: string; children: React.ReactNode }
 
 const FOLLOW_ACTIVE = "0"; // profile_id 0 = follow the active/default profile
 
-const defaultJudge = (): JudgeConfig => ({
-  enabled: false,
-  mode: "closed",
-  profile_id: 0,
-  prompt: "",
-  timeout_seconds: 15,
-  fail_action: "ask",
-  ask_timeout_seconds: 300,
-  ask_timeout_action: "deny",
-});
-
 function JudgeCard() {
-  const [cfg, setCfg] = React.useState<JudgeConfig>(defaultJudge());
-  const [profiles, setProfiles] = React.useState<LLMProfile[]>([]);
-  const [loading, setLoading] = React.useState(true);
-  const [saving, setSaving] = React.useState(false);
-  const [usage, setUsage] = React.useState<JudgeUsage | null>(null);
+  const [state, dispatch] = React.useReducer(judgeCardReducer, initialJudgeCardState);
+  const { cfg, profiles, loading, usage } = state;
+  const saving = state.requests.save.pending;
 
   // Approval usage stats: failures must not break the config page; fetched only when enabled.
   const loadUsage = React.useCallback(async () => {
     try {
-      setUsage(await api.interceptJudgeUsage(30));
+      dispatch({ type: "usageLoaded", usage: await api.interceptJudgeUsage(30) });
     } catch {
       // Ignore: stats being unavailable must not affect config editing
     }
   }, []);
 
   const load = React.useCallback(async () => {
-    setLoading(true);
+    dispatch({ type: "loadStarted" });
     try {
       const [j, ps] = await Promise.all([api.interceptGetJudgeConfig(), api.llmProfiles()]);
-      setCfg(j);
-      setProfiles(ps);
+      dispatch({ type: "configLoaded", cfg: j, profiles: ps });
     } catch (e) {
       toast.error(t("Failed to load model fallback config: {error}", { error: (e as Error).message }));
     } finally {
-      setLoading(false);
+      dispatch({ type: "loadFinished" });
     }
   }, []);
 
@@ -266,11 +223,11 @@ function JudgeCard() {
   }, [cfg.enabled, loadUsage]);
 
   function patch(p: Partial<JudgeConfig>) {
-    setCfg((c) => ({ ...c, ...p }));
+    dispatch({ type: "configChanged", patch: p });
   }
 
   async function save() {
-    setSaving(true);
+    dispatch({ type: "request/started", key: "save" });
     try {
       await api.interceptSetJudgeConfig(cfg);
       toast.success(t("Model fallback config saved"));
@@ -278,22 +235,22 @@ function JudgeCard() {
     } catch (e) {
       toast.error(t("Save failed: {error}", { error: (e as Error).message }));
     } finally {
-      setSaving(false);
+      dispatch({ type: "request/finished", key: "save" });
     }
   }
 
   async function restorePrompt() {
     // Clear the prompt and save → the server then returns the full built-in template, refilled into the input.
-    setSaving(true);
+    dispatch({ type: "request/started", key: "save" });
     try {
       await api.interceptSetJudgeConfig({ ...cfg, prompt: "" });
       const j = await api.interceptGetJudgeConfig();
-      setCfg(j);
+      dispatch({ type: "configRestored", cfg: j });
       toast.success(t("Built-in default template restored"));
     } catch (e) {
       toast.error(t("Restore failed: {error}", { error: (e as Error).message }));
     } finally {
-      setSaving(false);
+      dispatch({ type: "request/finished", key: "save" });
     }
   }
 
@@ -474,29 +431,24 @@ function JudgeCard() {
 // ---- page ----
 
 export default function InterceptPage() {
-  const [rules, setRules]     = React.useState<InterceptRule[]>([]);
-  const [loading, setLoading] = React.useState(true);
-  const [open, setOpen]       = React.useState(false);
-  const [editing, setEditing] = React.useState<InterceptRule | null>(null);
-  const [form, setForm]       = React.useState<RuleForm>(defaultForm());
-  const [saving, setSaving]   = React.useState(false);
-  const [regexErr, setRegexErr] = React.useState("");
-  const [regexWarn, setRegexWarn] = React.useState(false); // true = JS cannot parse it but it may be valid Go syntax
+  const [state, dispatch] = React.useReducer(interceptPageReducer, initialInterceptPageState);
+  const { items: rules } = state.list;
+  const loading = !state.list.loaded;
+  const { open, editing, form, regexWarn } = state.editor;
+  const saving = state.requests.save.pending;
 
   // ---- tool scope dialog ----
-  const [scopeOpen, setScopeOpen]       = React.useState(false);
-  const [allTools, setAllTools]         = React.useState<Tool[]>([]);
-  const [enabledTools, setEnabledTools] = React.useState<Set<string>>(new Set());
-  const [scopeLoading, setScopeLoading] = React.useState(false);
-  const [scopeSaving, setScopeSaving]   = React.useState(false);
-  const [scopeTools, setScopeTools]     = React.useState<string[]>([]); // header info bar: tools currently under interception
+  const { open: scopeOpen, allTools, enabledTools } = state.scope;
+  const scopeLoading = state.requests.scopeLoad.pending;
+  const scopeSaving = state.requests.scopeSave.pending;
+  const { scopeTools } = state; // header info bar: tools currently under interception
 
   // ---- data ----
 
   const loadScope = React.useCallback(async () => {
     try {
       const cfg = await api.interceptGetToolConfig();
-      setScopeTools(cfg.enabled_tools);
+      dispatch({ type: "scopeToolsLoaded", tools: cfg.enabled_tools });
     } catch {
       // Info bar is non-critical; stay silent on failure
     }
@@ -505,59 +457,49 @@ export default function InterceptPage() {
   const load = React.useCallback(async () => {
     try {
       const r = await api.interceptRules();
-      setRules(r);
+      dispatch({ type: "list/loaded", items: r });
     } catch {
       toast.error(t("Failed to load interception rules"));
     } finally {
-      setLoading(false);
+      dispatch({ type: "list/loadFinished" });
     }
   }, []);
 
   React.useEffect(() => { load(); loadScope(); }, [load, loadScope]);
 
   React.useEffect(() => {
-    if (form.match_type !== "regex" || !form.pattern) { setRegexErr(""); setRegexWarn(false); return; }
+    if (form.match_type !== "regex" || !form.pattern) {
+      dispatch({ type: "editorChanged", patch: { regexWarn: false } });
+      return;
+    }
     try {
       new RegExp(form.pattern);
-      setRegexErr("");
-      setRegexWarn(false);
+      dispatch({ type: "editorChanged", patch: { regexWarn: false } });
     } catch {
       // JS RegExp does not support Go RE2 extended syntax (e.g. the (?i) inline flag).
       // This is only a preview validation failure, not proof of invalidity on the Go side; the server does the final check.
-      setRegexErr("");
-      setRegexWarn(true);
+      dispatch({ type: "editorChanged", patch: { regexWarn: true } });
     }
   }, [form.pattern, form.match_type]);
 
   // ---- rule handlers ----
 
-  function set(patch: Partial<RuleForm>) { setForm(f => ({ ...f, ...patch })); }
+  function set(patch: Partial<RuleForm>) {
+    dispatch({ type: "formFieldChanged", patch });
+  }
 
   function openNew() {
-    setEditing(null);
-    setForm(defaultForm());
-    setRegexErr("");
-    setOpen(true);
+    dispatch({ type: "newRuleOpened" });
   }
 
   function openEdit(rule: InterceptRule) {
-    setEditing(rule);
-    setForm({
-      name: rule.name, enabled: rule.enabled, priority: rule.priority,
-      match_target: rule.match_target, match_type: rule.match_type,
-      pattern: rule.pattern, action: rule.action, message: rule.message,
-      timeout_enabled: rule.timeout_enabled, timeout_seconds: rule.timeout_seconds,
-      timeout_action: rule.timeout_action,
-    });
-    setRegexErr("");
-    setOpen(true);
+    dispatch({ type: "editRuleOpened", rule });
   }
 
   async function handleSave() {
     if (!form.name.trim())    { toast.error(t("Name cannot be empty")); return; }
     if (!form.pattern.trim()) { toast.error(t("Pattern cannot be empty")); return; }
-    if (regexErr)             { toast.error(t("Invalid regex syntax")); return; }
-    setSaving(true);
+    dispatch({ type: "request/started", key: "save" });
     try {
       if (editing) {
         await api.updateInterceptRule(editing.id, form);
@@ -566,12 +508,12 @@ export default function InterceptPage() {
         await api.createInterceptRule(form);
         toast.success(t("Rule created"));
       }
-      setOpen(false);
+      dispatch({ type: "editorChanged", patch: { open: false } });
       load();
     } catch (e) {
       toast.error((e as Error).message);
     } finally {
-      setSaving(false);
+      dispatch({ type: "request/finished", key: "save" });
     }
   }
 
@@ -597,38 +539,32 @@ export default function InterceptPage() {
   // ---- scope handlers ----
 
   async function openScope() {
-    setScopeOpen(true);
-    setScopeLoading(true);
+    dispatch({ type: "scopeOpenChanged", open: true });
+    dispatch({ type: "request/started", key: "scopeLoad" });
     try {
       const [tools, cfg] = await Promise.all([api.tools(), api.interceptGetToolConfig()]);
-      setAllTools(tools);
-      setEnabledTools(new Set(cfg.enabled_tools));
+      dispatch({ type: "scopeLoaded", allTools: tools, enabledTools: cfg.enabled_tools });
     } catch (e) {
       toast.error(t("Load failed: {error}", { error: (e as Error).message }));
     } finally {
-      setScopeLoading(false);
+      dispatch({ type: "request/finished", key: "scopeLoad" });
     }
   }
 
   function toggleTool(key: string, val: boolean) {
-    setEnabledTools(prev => {
-      const next = new Set(prev);
-      if (val) next.add(key); else next.delete(key);
-      return next;
-    });
+    dispatch({ type: "scopeToolChecked", key, checked: val });
   }
 
   async function saveScope() {
-    setScopeSaving(true);
+    dispatch({ type: "request/started", key: "scopeSave" });
     try {
       await api.interceptSetToolConfig([...enabledTools]);
       toast.success(t("Interception scope saved"));
-      setScopeTools([...enabledTools]);
-      setScopeOpen(false);
+      dispatch({ type: "scopeSaved", tools: [...enabledTools] });
     } catch (e) {
       toast.error(t("Save failed: {error}", { error: (e as Error).message }));
     } finally {
-      setScopeSaving(false);
+      dispatch({ type: "request/finished", key: "scopeSave" });
     }
   }
 
@@ -794,7 +730,7 @@ export default function InterceptPage() {
       </Tabs>
 
       {/* ---- editor sheet ---- */}
-      <Sheet open={open} onOpenChange={setOpen}>
+      <Sheet open={open} onOpenChange={(next) => dispatch({ type: "editorChanged", patch: { open: next } })}>
         <SheetContent side="right" className="flex flex-col gap-0 p-0 sm:max-w-md">
           <SheetHeader className="border-b px-6 py-4">
             <SheetTitle>{editing ? t("Edit rule") : t("Create rule")}</SheetTitle>
@@ -858,11 +794,7 @@ export default function InterceptPage() {
                 placeholder={form.match_type === "regex" ? "^Bash$" : form.match_type === "argv" ? '["git","push"]' : "rm -rf"}
                 value={form.pattern}
                 onChange={(e) => set({ pattern: e.target.value })}
-                className={regexErr ? "border-destructive focus-visible:ring-destructive" : ""}
               />
-              {regexErr && (
-                <p className="text-xs text-destructive mt-1">{regexErr}</p>
-              )}
               {regexWarn && (
                 <p className="text-xs text-amber-600 mt-1">
                   {tRich("Contains Go RE2 extended syntax (e.g. {example}); the browser cannot preview it, and the server validates on submission", {
@@ -969,8 +901,10 @@ export default function InterceptPage() {
           </div>
 
           <SheetFooter className="border-t px-6 py-4 flex-row justify-end gap-2">
-            <Button variant="outline" onClick={() => setOpen(false)}>{t("Cancel")}</Button>
-            <Button onClick={handleSave} disabled={saving || !!regexErr}>
+            <Button variant="outline" onClick={() => dispatch({ type: "editorChanged", patch: { open: false } })}>
+              {t("Cancel")}
+            </Button>
+            <Button onClick={handleSave} disabled={saving}>
               {saving ? t("Saving…") : t("Save")}
             </Button>
           </SheetFooter>
@@ -978,7 +912,7 @@ export default function InterceptPage() {
       </Sheet>
 
       {/* ---- scope dialog ---- */}
-      <Dialog open={scopeOpen} onOpenChange={setScopeOpen}>
+      <Dialog open={scopeOpen} onOpenChange={(next) => dispatch({ type: "scopeOpenChanged", open: next })}>
         <DialogContent className="sm:max-w-lg flex flex-col overflow-hidden p-0 gap-0" style={{ maxHeight: "min(80vh, 560px)" }}>
           <DialogHeader className="shrink-0 border-b px-6 py-4">
             <DialogTitle className="flex items-center gap-2">
@@ -1028,7 +962,9 @@ export default function InterceptPage() {
           </div>
 
           <div className="shrink-0 border-t px-6 py-3 flex justify-end gap-2">
-            <Button variant="outline" size="sm" onClick={() => setScopeOpen(false)}>{t("Cancel")}</Button>
+            <Button variant="outline" size="sm" onClick={() => dispatch({ type: "scopeOpenChanged", open: false })}>
+              {t("Cancel")}
+            </Button>
             <Button size="sm" onClick={saveScope} disabled={scopeSaving || scopeLoading}>
               {scopeSaving ? t("Saving…") : t("Save")}
             </Button>

@@ -22,28 +22,14 @@ import { Card, CardContent, CardHeader } from "@/components/ui/card";
 import { type ChartConfig, ChartContainer, ChartTooltip, ChartTooltipContent } from "@/components/ui/chart";
 import { Progress } from "@/components/ui/progress";
 import { api } from "@/lib/api";
-import type {
-  Activity,
-  Agent,
-  ConvTokenSummary,
-  Finding,
-  InterceptPending,
-  LLMProfile,
-  MCPServer,
-  Settings,
-  SkillItem,
-  Stats,
-  Task,
-  TokenTotal,
-  Tool,
-  TrafficExchange,
-  UsageStats,
-} from "@/lib/types";
+import type { Activity } from "@/lib/types";
 import { formatTokens } from "@/lib/format";
 import { cn } from "@/lib/utils";
 import { t } from "@/i18n";
 import { setVisibleInterval } from "@/lib/polling";
 import { useActiveCompany } from "@/stores/company/company-store";
+
+import { dashboardPageReducer, initialDashboardPageState } from "./_state/dashboard-page.reducer";
 
 // ── chart constants ───────────────────────────────────────────────────────────
 
@@ -131,23 +117,11 @@ export default function DashboardPage() {
   // The sidebar's company switcher narrows the finding-derived panels to that
   // company (server-side `company` filter). Undefined means all companies.
   const company = useActiveCompany();
-  // data state
-  const [tasks, setTasks] = React.useState<Task[]>([]);
-  const [findings, setFindings] = React.useState<Finding[]>([]);
-  const [stats, setStats] = React.useState<Stats | null>(null);
-  const [settings, setSettings] = React.useState<Settings | null>(null);
-  const [pending, setPending] = React.useState<InterceptPending[]>([]);
-  const [activity, setActivity] = React.useState<Activity[]>([]);
-  const [tokens, setTokens] = React.useState<TokenTotal | null>(null);
-  const [convTokens, setConvTokens] = React.useState<ConvTokenSummary[]>([]);
-  const [usageStats, setUsageStats] = React.useState<UsageStats | null>(null);
-  const [assetCounts, setAssetCounts] = React.useState<Record<string, number>>({});
-  const [traffic, setTraffic] = React.useState<TrafficExchange[]>([]);
-  const [agents, setAgents] = React.useState<Agent[]>([]);
-  const [mcpServers, setMcpServers] = React.useState<MCPServer[]>([]);
-  const [skills, setSkills] = React.useState<SkillItem[]>([]);
-  const [tools, setTools] = React.useState<Tool[]>([]);
-  const [llmProfiles, setLLMProfiles] = React.useState<LLMProfile[]>([]);
+  const [state, dispatch] = React.useReducer(dashboardPageReducer, initialDashboardPageState);
+  const { tasks, live, system, tokenView } = state;
+  const { findings, stats, settings, pending, activity, convTokens } = live;
+  const { traffic, assetCounts, tools, llmProfiles, usageStats } = system;
+  const { version: tokenVersion, tab: tokenTab, days: tokenDays } = tokenView;
 
   // The task list is the most expensive dashboard source. Poll it independently
   // so a large history cannot hold back every other dashboard panel.
@@ -164,7 +138,7 @@ export default function DashboardPage() {
         const nextSignature = JSON.stringify(tr.tasks);
         if (nextSignature !== signature) {
           signature = nextSignature;
-          setTasks(tr.tasks);
+          dispatch({ type: "tasksLoaded", tasks: tr.tasks });
         }
       } catch {
         /* transient errors — next poll retries */
@@ -198,13 +172,18 @@ export default function DashboardPage() {
           api.conversationTokens(),
         ]);
         if (!alive) return;
-        setFindings(findings);
-        setStats(stats);
-        setSettings(settings);
-        setPending(pending);
-        setActivity(activity.items);
-        setTokens(tokens.total ?? null);
-        setConvTokens(conversationTokens);
+        dispatch({
+          type: "liveLoaded",
+          live: {
+            findings,
+            stats,
+            settings,
+            pending,
+            activity: activity.items,
+            tokens: tokens.total ?? null,
+            convTokens: conversationTokens,
+          },
+        });
       } catch {
         // Preserve stale data and retry on the next interval.
       } finally {
@@ -235,14 +214,19 @@ export default function DashboardPage() {
           api.usageStats(365),
         ]);
         if (!alive) return;
-        setTraffic(traf.exchanges ?? []);
-        setAssetCounts(counts ?? {});
-        setAgents(agentList);
-        setMcpServers(mcpList);
-        setSkills(skillList);
-        setTools(toolList);
-        setLLMProfiles(profileList);
-        setUsageStats(usage);
+        dispatch({
+          type: "systemLoaded",
+          system: {
+            traffic: traf.exchanges ?? [],
+            assetCounts: counts ?? {},
+            agents: agentList,
+            mcpServers: mcpList,
+            skills: skillList,
+            tools: toolList,
+            llmProfiles: profileList,
+            usageStats: usage,
+          },
+        });
       } catch {
         /* transient errors */
       }
@@ -328,13 +312,6 @@ export default function DashboardPage() {
   // ── token stats per LLM profile ──────────────────────────────────────────
   // tasks whose llm_profile_id is null/undefined used the active default profile
   const defaultProfileId = activeProfile ? Number(activeProfile.id) : null;
-
-  // Data source toggle: old = activity (task.tokens + conversations), new = the llm_usage metering ledger.
-  const [tokenVersion, setTokenVersion] = React.useState<"old" | "new">("old");
-  // selected profile tab: "all" = all; number = specific profile id
-  const [tokenTab, setTokenTab] = React.useState<number | null | "all">("all");
-  // day range for the daily bar chart
-  const [tokenDays, setTokenDays] = React.useState<7 | 30 | 90 | 180 | 365>(30);
 
   // profile name → id, mapping llm_usage profile_name to the existing profile tabs.
   const profileIdByName = React.useMemo(() => {
@@ -616,7 +593,7 @@ export default function DashboardPage() {
                 <button
                   type="button"
                   key={v}
-                  onClick={() => setTokenVersion(v)}
+                  onClick={() => dispatch({ type: "tokenViewChanged", patch: { version: v } })}
                   title={
                     v === "new"
                       ? t(
@@ -645,7 +622,7 @@ export default function DashboardPage() {
           <div className="flex flex-wrap items-center gap-1">
             <button
               type="button"
-              onClick={() => setTokenTab("all")}
+              onClick={() => dispatch({ type: "tokenViewChanged", patch: { tab: "all" } })}
               className={cn(
                 "rounded-md px-2.5 py-1 text-[10px] font-medium transition-colors",
                 tokenTab === "all"
@@ -663,7 +640,7 @@ export default function DashboardPage() {
                 <button
                   type="button"
                   key={p.id}
-                  onClick={() => setTokenTab(resolvedKey)}
+                  onClick={() => dispatch({ type: "tokenViewChanged", patch: { tab: resolvedKey } })}
                   className={cn(
                     "flex items-center gap-1 rounded-md px-2.5 py-1 text-[10px] font-medium transition-colors",
                     tokenTab === resolvedKey
@@ -795,7 +772,7 @@ export default function DashboardPage() {
                   <button
                     type="button"
                     key={days}
-                    onClick={() => setTokenDays(days)}
+                    onClick={() => dispatch({ type: "tokenViewChanged", patch: { days } })}
                     className={cn(
                       "rounded px-2.5 py-0.5 text-[9px] font-medium transition-colors",
                       tokenDays === days

@@ -42,6 +42,8 @@ import { t } from "@/i18n";
 import { api } from "@/lib/api";
 import type { Agent } from "@/lib/types";
 
+import { createAgentDialogReducer, initialCreateAgentDialogState } from "./_state/create-agent-dialog.reducer";
+
 // AgentGridCard is one clickable tile opening the agent's editor drawer. Custom
 // (non-builtin) agents get a delete button.
 function AgentGridCard({
@@ -124,26 +126,22 @@ function AgentGridCard({
 }
 
 function CreateAgentDialog({ onCreated }: { onCreated: (key: string) => void }) {
-  const [open, setOpen] = React.useState(false);
-  const [key, setKey] = React.useState("");
-  const [name, setName] = React.useState("");
-  const [description, setDescription] = React.useState("");
-  const [busy, setBusy] = React.useState(false);
+  const [state, dispatch] = React.useReducer(createAgentDialogReducer, initialCreateAgentDialogState);
+  const { open, form } = state;
+  const { key, name, description } = form;
+  const busy = state.requests.create.pending;
 
   async function create() {
-    setBusy(true);
+    dispatch({ type: "request/started", key: "create" });
     try {
       const a = await api.createAgent(key.trim(), name.trim(), description.trim());
       toast.success(t('Agent "{name}" created', { name: a.name }));
-      setOpen(false);
-      setKey("");
-      setName("");
-      setDescription("");
+      dispatch({ type: "created" });
       onCreated(a.key);
     } catch (e) {
       toast.error(t("Create failed: {error}", { error: (e as Error).message }));
     } finally {
-      setBusy(false);
+      dispatch({ type: "request/finished", key: "create" });
     }
   }
 
@@ -151,7 +149,7 @@ function CreateAgentDialog({ onCreated }: { onCreated: (key: string) => void }) 
   const canCreate = keyOk && name.trim().length > 0 && !busy;
 
   return (
-    <Dialog open={open} onOpenChange={setOpen}>
+    <Dialog open={open} onOpenChange={(o) => dispatch({ type: "openChanged", open: o })}>
       <DialogTrigger asChild>
         <Button size="sm">
           <PlusIcon /> {t("Create agent")}
@@ -173,7 +171,7 @@ function CreateAgentDialog({ onCreated }: { onCreated: (key: string) => void }) 
               id="agent-key"
               placeholder={t("e.g. research_helper")}
               value={key}
-              onChange={(e) => setKey(e.target.value)}
+              onChange={(e) => dispatch({ type: "formFieldChanged", patch: { key: e.target.value } })}
               className="font-mono"
             />
             {key.length > 0 && !keyOk && (
@@ -188,7 +186,7 @@ function CreateAgentDialog({ onCreated }: { onCreated: (key: string) => void }) 
               id="agent-name"
               placeholder={t("e.g. Research assistant")}
               value={name}
-              onChange={(e) => setName(e.target.value)}
+              onChange={(e) => dispatch({ type: "formFieldChanged", patch: { name: e.target.value } })}
             />
           </div>
           <div className="grid gap-1.5">
@@ -198,7 +196,7 @@ function CreateAgentDialog({ onCreated }: { onCreated: (key: string) => void }) 
               placeholder={t("One line on what this agent does")}
               rows={2}
               value={description}
-              onChange={(e) => setDescription(e.target.value)}
+              onChange={(e) => dispatch({ type: "formFieldChanged", patch: { description: e.target.value } })}
             />
           </div>
         </div>

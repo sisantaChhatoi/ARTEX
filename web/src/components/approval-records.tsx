@@ -42,7 +42,6 @@ import type {
   InterceptApprovalRow,
   InterceptAudit,
   InterceptDetail,
-  InterceptPending,
   InterceptReviewInput,
   InterceptRisk,
 } from "@/lib/types";
@@ -50,6 +49,8 @@ import { formatShortDateTime } from "@/lib/format";
 import { cn } from "@/lib/utils";
 import { setVisibleInterval } from "@/lib/polling";
 import { t } from "@/i18n";
+
+import { approvalRecordsReducer, initialApprovalRecordsState } from "./_state/approval-records.reducer";
 
 function source(row: InterceptApprovalRow) {
   if (row.decision_source) return row.decision_source;
@@ -823,21 +824,17 @@ function ApprovalTable({
 }
 
 export function ApprovalRecords({ taskId }: { taskId?: string }) {
-  const [rows, setRows] = React.useState<InterceptApprovalRow[]>([]);
-  const [pendingRows, setPendingRows] = React.useState<InterceptPending[]>([]);
-  const [page, setPage] = React.useState(1);
-  const [pageSize, setPageSize] = React.useState(20);
-  const [total, setTotal] = React.useState(0);
-  const [filter, setFilter] = React.useState<InterceptApprovalFilter>({});
-  const [loading, setLoading] = React.useState(true);
-  const [refreshing, setRefreshing] = React.useState(false);
-  const [error, setError] = React.useState("");
-  const [pendingError, setPendingError] = React.useState("");
-  const [deciding, setDeciding] = React.useState(false);
-  const [revision, setRevision] = React.useState(0);
-  const [selected, setSelected] = React.useState<Set<number>>(() => new Set());
-  const [batchDecision, setBatchDecision] = React.useState<"allowed" | "denied" | null>(null);
-  const [batchErrors, setBatchErrors] = React.useState<{ id: number; error: string }[]>([]);
+  const [state, dispatch] = React.useReducer(approvalRecordsReducer, initialApprovalRecordsState);
+  const { filter, pagination, list, pendingRows, revision, batch } = state;
+  const { page, size: pageSize } = pagination;
+  const { items: rows, total } = list;
+  // Skeleton until the first load for the current filter settles; spinner while a manual refresh runs.
+  const loading = !list.loaded;
+  const refreshing = list.loading;
+  const { history: error, pending: pendingError } = state.errors;
+  const deciding = state.requests.decide.pending;
+  const selected = state.selection;
+  const { decision: batchDecision, errors: batchErrors } = batch;
   const request = React.useRef(0);
   const decisionLock = React.useRef(false);
   const filterID = React.useId();
@@ -847,13 +844,13 @@ export function ApprovalRecords({ taskId }: { taskId?: string }) {
   // Reset the cursor so the new scope always starts at its newest records.
   // biome-ignore lint/correctness/useExhaustiveDependencies: taskId intentionally resets pagination when scope changes.
   React.useEffect(() => {
-    setPage(1);
+    dispatch({ type: "pagination/pageChanged", page: 1 });
   }, [taskId]);
 
   const load = React.useCallback(
     async (manual = false) => {
       const id = ++request.current;
-      if (manual) setRefreshing(true);
+      if (manual) dispatch({ type: "list/loadStarted" });
       try {
         // The approval queue is independent of the current history page and its
         // filter. Older requests must remain actionable even when newer decisions
@@ -863,27 +860,23 @@ export function ApprovalRecords({ taskId }: { taskId?: string }) {
           api.interceptPending(),
         ]);
         if (id !== request.current) return;
-        if (history.status === "fulfilled") {
-          setRows(history.value.items);
-          setTotal(history.value.total);
-          setError("");
-        } else {
-          setError((history.reason as Error).message || t("Failed to load"));
-        }
-        if (pending.status === "fulfilled") {
-          setPendingRows(pending.value);
-          setPendingError("");
-        } else {
-          setPendingError((pending.reason as Error).message || t("Failed to load"));
-        }
-        if (manual) setRevision((v) => v + 1);
+        dispatch({
+          type: "loadSettled",
+          history:
+            history.status === "fulfilled"
+              ? { ok: true, value: history.value }
+              : { ok: false, error: (history.reason as Error).message || t("Failed to load") },
+          pending:
+            pending.status === "fulfilled"
+              ? { ok: true, value: pending.value }
+              : { ok: false, error: (pending.reason as Error).message || t("Failed to load") },
+          manual,
+        });
       } catch (e) {
-        if (id === request.current) setError((e as Error).message || t("Failed to load"));
+        if (id === request.current)
+          dispatch({ type: "historyFailed", error: (e as Error).message || t("Failed to load") });
       } finally {
-        if (id === request.current) {
-          setLoading(false);
-          setRefreshing(false);
-        }
+        if (id === request.current) dispatch({ type: "list/loadFinished" });
       }
     },
     [taskId, page, pageSize, filter],
@@ -900,39 +893,26 @@ export function ApprovalRecords({ taskId }: { taskId?: string }) {
     };
   }, [load]);
 
-  const changePageSize = (next: number) => {
-    setPageSize(next);
-    setPage(1);
-  };
+  // A new page size returns to the first page (pagination slice rule).
+  const changePageSize = (next: number) => dispatch({ type: "pagination/sizeChanged", size: next });
 
   const changeFilter = (next: InterceptApprovalFilter) => {
     // An in-flight response for the old filter must not repopulate the table.
     request.current++;
-    setFilter(next);
-    setPage(1);
-    setRows([]);
-    setTotal(0);
-    setError("");
-    setLoading(true);
+    dispatch({ type: "filterChanged", filter: next });
   };
 
   const decide: Decide = async (id, decision) => {
     if (decisionLock.current) return;
     decisionLock.current = true;
-    setDeciding(true);
+    dispatch({ type: "request/started", key: "decide" });
     try {
       await api.interceptDecide(id, decision);
       // Invalidate a list request started before this decision.
       request.current++;
       // Optimistically drop the decided item from the independent pending queue
       // for instant feedback; the re-fetch below reconciles with server truth.
-      setRows((prev) =>
-        prev.map((row) =>
-          row.id === id ? { ...row, status: decision, decided_by: "human", decided_at: new Date().toISOString() } : row,
-        ),
-      );
-      setPendingRows((prev) => prev.filter((row) => row.id !== id));
-      setRevision((v) => v + 1);
+      dispatch({ type: "decided", id, decision, at: new Date().toISOString() });
       toast.success(decision === "allowed" ? t("Execution allowed") : t("Execution denied"));
       // Re-fetch counts and rows: a decided item may no longer match the filter.
       await latestLoad.current(true);
@@ -941,7 +921,7 @@ export function ApprovalRecords({ taskId }: { taskId?: string }) {
       await latestLoad.current(true);
     } finally {
       decisionLock.current = false;
-      setDeciding(false);
+      dispatch({ type: "request/finished", key: "decide" });
     }
   };
 
@@ -960,15 +940,13 @@ export function ApprovalRecords({ taskId }: { taskId?: string }) {
   const selectedHigh = selectedRows.filter((row) => row.risk?.level === "high").length;
   const selection: Selection = {
     selected,
-    toggle: (id) =>
-      setSelected((prev) => {
-        const next = new Set(prev);
-        if (next.has(id)) next.delete(id);
-        else next.add(id);
-        return next;
-      }),
+    toggle: (id) => dispatch({ type: "selection/toggled", id }),
     toggleAll: () =>
-      setSelected(selectedRows.length === pending.length ? new Set() : new Set(pending.map((row) => row.id))),
+      dispatch(
+        selectedRows.length === pending.length
+          ? { type: "selection/cleared" }
+          : { type: "selection/set", ids: pending.map((row) => row.id) },
+      ),
   };
 
   // Each id is decided by the server exactly like a single decision. The server
@@ -982,7 +960,7 @@ export function ApprovalRecords({ taskId }: { taskId?: string }) {
     const ids = selectedRows.map((row) => row.id);
     if (!ids.length || decisionLock.current) return;
     decisionLock.current = true;
-    setDeciding(true);
+    dispatch({ type: "request/started", key: "decide" });
     let decided = 0;
     const failed: { id: number; error: string }[] = [];
     try {
@@ -998,9 +976,7 @@ export function ApprovalRecords({ taskId }: { taskId?: string }) {
         }
       }
       request.current++;
-      setBatchErrors(failed);
-      setSelected(new Set(failed.map((f) => f.id)));
-      setRevision((v) => v + 1);
+      dispatch({ type: "batchDecided", failed });
       if (failed.length)
         toast.error(
           decision === "allowed"
@@ -1010,8 +986,8 @@ export function ApprovalRecords({ taskId }: { taskId?: string }) {
       else toast.success(decision === "allowed" ? t("{count} allowed", { count: decided }) : t("{count} denied", { count: decided }));
     } finally {
       decisionLock.current = false;
-      setDeciding(false);
-      setBatchDecision(null);
+      dispatch({ type: "request/finished", key: "decide" });
+      dispatch({ type: "batchChanged", patch: { decision: null } });
       await latestLoad.current(true);
     }
   };
@@ -1161,7 +1137,11 @@ export function ApprovalRecords({ taskId }: { taskId?: string }) {
           <div className="flex flex-wrap items-center justify-between gap-2 border-t px-4 py-3 text-sm">
             <span className="text-muted-foreground">{t("{count} selected", { count: selectedRows.length })}</span>
             <div className="flex flex-wrap gap-2">
-              <Button size="sm" disabled={deciding || !selectedRows.length} onClick={() => setBatchDecision("allowed")}>
+              <Button
+                size="sm"
+                disabled={deciding || !selectedRows.length}
+                onClick={() => dispatch({ type: "batchChanged", patch: { decision: "allowed" } })}
+              >
                 <CheckIcon data-icon="inline-start" />
                 {t("Approve selected")}
               </Button>
@@ -1169,7 +1149,7 @@ export function ApprovalRecords({ taskId }: { taskId?: string }) {
                 size="sm"
                 variant="destructive"
                 disabled={deciding || !selectedRows.length}
-                onClick={() => setBatchDecision("denied")}
+                onClick={() => dispatch({ type: "batchChanged", patch: { decision: "denied" } })}
               >
                 <XIcon data-icon="inline-start" />
                 {t("Deny selected")}
@@ -1181,7 +1161,7 @@ export function ApprovalRecords({ taskId }: { taskId?: string }) {
       <AlertDialog
         open={batchDecision != null}
         onOpenChange={(open) => {
-          if (!open && !deciding) setBatchDecision(null);
+          if (!open && !deciding) dispatch({ type: "batchChanged", patch: { decision: null } });
         }}
       >
         <AlertDialogContent>
@@ -1247,7 +1227,7 @@ export function ApprovalRecords({ taskId }: { taskId?: string }) {
             page={page}
             pageSize={pageSize}
             total={total}
-            onPageChange={setPage}
+            onPageChange={(next) => dispatch({ type: "pagination/pageChanged", page: next })}
             onPageSizeChange={changePageSize}
             pageSizeOptions={[10, 20, 50]}
           />

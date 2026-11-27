@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useReducer } from "react";
 
 import { useRouter } from "next/navigation";
 
@@ -11,17 +11,15 @@ import { t } from "@/i18n";
 import { api } from "@/lib/api";
 import { auth } from "@/lib/auth";
 
+import { initialSetupPageState, setupPageReducer } from "./_state/setup-page.reducer";
+
 export default function SetupPage() {
   const router = useRouter();
-  const [password, setPassword] = useState("");
-  const [confirm, setConfirm] = useState("");
-  const [setupToken, setSetupToken] = useState("");
-  const [error, setError] = useState("");
-  const [loading, setLoading] = useState(false);
-  const [checking, setChecking] = useState(true);
+  const [state, dispatch] = useReducer(setupPageReducer, initialSetupPageState);
+  const { password, confirm, setupToken } = state.form;
   // when the initialization state cannot be fetched, do not default to "not initialized" — that would show the setup form to an
   // instance that already has a password, and following it would overwrite the original. Close the entrance instead.
-  const [unavailable, setUnavailable] = useState(false);
+  const { checking, unavailable, submitting: loading, error } = state.status;
 
   useEffect(() => {
     api
@@ -30,32 +28,33 @@ export default function SetupPage() {
         if (initialized) router.replace("/login");
       })
       .catch((err) => {
-        setError(err instanceof Error ? err.message : t("Unable to connect to the backend service"));
-        setUnavailable(true);
+        dispatch({
+          type: "statusCheckFailed",
+          error: err instanceof Error ? err.message : t("Unable to connect to the backend service"),
+        });
       })
-      .finally(() => setChecking(false));
+      .finally(() => dispatch({ type: "statusChecked" }));
   }, [router]);
 
   async function handleSubmit(e: React.FormEvent) {
     e.preventDefault();
     if (password !== confirm) {
-      setError(t("The two passwords do not match"));
+      dispatch({ type: "validationFailed", error: t("The two passwords do not match") });
       return;
     }
     if (password.length < 12) {
-      setError(t("Password must be at least 12 characters"));
+      dispatch({ type: "validationFailed", error: t("Password must be at least 12 characters") });
       return;
     }
-    setLoading(true);
-    setError("");
+    dispatch({ type: "submitStarted" });
     try {
       const { token } = await api.initPassword(password, setupToken.trim());
       auth.setToken(token);
       router.replace("/function/tasks");
     } catch (err) {
-      setError(err instanceof Error ? err.message : t("Initialization failed"));
+      dispatch({ type: "submitFailed", error: err instanceof Error ? err.message : t("Initialization failed") });
     } finally {
-      setLoading(false);
+      dispatch({ type: "submitFinished" });
     }
   }
 
@@ -106,7 +105,7 @@ export default function SetupPage() {
                 <Input
                   id="setup-token"
                   value={setupToken}
-                  onChange={(e) => setSetupToken(e.target.value)}
+                  onChange={(e) => dispatch({ type: "formFieldChanged", patch: { setupToken: e.target.value } })}
                   placeholder={t("Printed in the server log at startup")}
                   autoFocus
                   autoComplete="off"
@@ -118,7 +117,7 @@ export default function SetupPage() {
                   id="password"
                   type="password"
                   value={password}
-                  onChange={(e) => setPassword(e.target.value)}
+                  onChange={(e) => dispatch({ type: "formFieldChanged", patch: { password: e.target.value } })}
                   placeholder={t("At least 12 characters")}
                   autoComplete="new-password"
                 />
@@ -129,7 +128,7 @@ export default function SetupPage() {
                   id="confirm"
                   type="password"
                   value={confirm}
-                  onChange={(e) => setConfirm(e.target.value)}
+                  onChange={(e) => dispatch({ type: "formFieldChanged", patch: { confirm: e.target.value } })}
                   placeholder={t("Enter the password again")}
                   autoComplete="new-password"
                 />

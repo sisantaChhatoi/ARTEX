@@ -4,6 +4,11 @@ import * as React from "react";
 
 import { toast } from "sonner";
 
+import {
+  createTrafficPickerState,
+  PAGE_SIZE,
+  trafficPickerReducer,
+} from "@/components/_state/traffic-picker-dialog.reducer";
 import { CapturedTrafficViewer } from "@/components/traffic-evidence-viewer";
 import { Alert, AlertDescription } from "@/components/ui/alert";
 import { Badge } from "@/components/ui/badge";
@@ -22,7 +27,7 @@ import { Input } from "@/components/ui/input";
 import { Select, SelectContent, SelectGroup, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
 import { api } from "@/lib/api";
-import type { FindingTrafficBinding, TrafficResp } from "@/lib/types";
+import type { FindingTrafficBinding } from "@/lib/types";
 import { intlLocale, t } from "@/i18n";
 
 const METHODS = ["GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS"];
@@ -40,32 +45,26 @@ export function TrafficPickerDialog({
   onClose: () => void;
   onBound: () => void;
 }) {
-  const [host, setHost] = React.useState("");
-  const [method, setMethod] = React.useState("all");
-  const [query, setQuery] = React.useState("");
-  const [page, setPage] = React.useState(0);
-  const [data, setData] = React.useState<TrafficResp | null>(null);
-  const [selected, setSelected] = React.useState<Set<string>>(() => new Set());
-  const [preview, setPreview] = React.useState<string | null>(null);
-  const [loading, setLoading] = React.useState(true);
-  const [busy, setBusy] = React.useState(false);
-  const [error, setError] = React.useState("");
+  const [state, dispatch] = React.useReducer(trafficPickerReducer, undefined, createTrafficPickerState);
+  const { filters, selected, preview, saving: busy, error } = state;
+  const { host, method, query } = filters;
+  const { page } = state.pagination;
+  const { items: rows, total, loading } = state.list;
   const alreadyBound = new Set(bound.map((b) => b.snapshot.source_traffic_id));
   React.useEffect(() => {
     let active = true;
-    setLoading(true);
-    setError("");
+    dispatch({ type: "list/loadStarted" });
     const timer = setTimeout(() => {
       api
-        .traffic(page, 25, host, method === "all" ? "" : method, query)
+        .traffic(page, PAGE_SIZE, host, method === "all" ? "" : method, query)
         .then((d) => {
-          if (active) setData(d);
+          if (active) dispatch({ type: "list/loaded", items: d.exchanges ?? [], total: d.total ?? 0 });
         })
         .catch((e: Error) => {
-          if (active) setError(e.message);
+          if (active) dispatch({ type: "loadFailed", error: e.message });
         })
         .finally(() => {
-          if (active) setLoading(false);
+          if (active) dispatch({ type: "list/loadFinished" });
         });
     }, 250);
     return () => {
@@ -74,19 +73,12 @@ export function TrafficPickerDialog({
     };
   }, [page, host, method, query]);
 
-  const rows = data?.exchanges ?? [];
   const selectable = rows.filter((e) => !alreadyBound.has(e.id));
   function toggle(id: string, checked: boolean) {
-    setSelected((previous) => {
-      const next = new Set(previous);
-      if (checked) next.add(id);
-      else next.delete(id);
-      return next;
-    });
+    dispatch({ type: "selectionChanged", ids: [id], checked });
   }
   async function save() {
-    setBusy(true);
-    setError("");
+    dispatch({ type: "saveStarted" });
     try {
       await api.bindFindingTraffic(
         findingId,
@@ -97,9 +89,9 @@ export function TrafficPickerDialog({
       onBound();
       onClose();
     } catch (e) {
-      setError((e as Error).message);
+      dispatch({ type: "saveFailed", error: (e as Error).message });
     } finally {
-      setBusy(false);
+      dispatch({ type: "saveFinished" });
     }
   }
 
@@ -125,21 +117,12 @@ export function TrafficPickerDialog({
                 id="evidence-host"
                 value={host}
                 placeholder={t("Domain or IP")}
-                onChange={(e) => {
-                  setHost(e.target.value);
-                  setPage(0);
-                }}
+                onChange={(e) => dispatch({ type: "filtersChanged", patch: { host: e.target.value } })}
               />
             </Field>
             <Field>
               <FieldLabel htmlFor="evidence-method">{t("Request method")}</FieldLabel>
-              <Select
-                value={method}
-                onValueChange={(v) => {
-                  setMethod(v);
-                  setPage(0);
-                }}
-              >
+              <Select value={method} onValueChange={(v) => dispatch({ type: "filtersChanged", patch: { method: v } })}>
                 <SelectTrigger id="evidence-method">
                   <SelectValue />
                 </SelectTrigger>
@@ -161,10 +144,7 @@ export function TrafficPickerDialog({
                 id="evidence-query"
                 value={query}
                 placeholder={t("URL / body keyword")}
-                onChange={(e) => {
-                  setQuery(e.target.value);
-                  setPage(0);
-                }}
+                onChange={(e) => dispatch({ type: "filtersChanged", patch: { query: e.target.value } })}
               />
             </Field>
           </FieldGroup>
@@ -183,13 +163,10 @@ export function TrafficPickerDialog({
                       disabled={loading || busy || selectable.length === 0}
                       checked={selectable.length > 0 && selectable.every((e) => selected.has(e.id))}
                       onCheckedChange={(checked) =>
-                        setSelected((previous) => {
-                          const next = new Set(previous);
-                          for (const e of selectable) {
-                            if (checked === true) next.add(e.id);
-                            else next.delete(e.id);
-                          }
-                          return next;
+                        dispatch({
+                          type: "selectionChanged",
+                          ids: selectable.map((e) => e.id),
+                          checked: checked === true,
                         })
                       }
                     />
@@ -222,7 +199,7 @@ export function TrafficPickerDialog({
                     </TableCell>
                     <TableCell>{e.status}</TableCell>
                     <TableCell>
-                      <Button variant="ghost" size="sm" onClick={() => setPreview(e.id)}>
+                      <Button variant="ghost" size="sm" onClick={() => dispatch({ type: "previewChanged", id: e.id })}>
                         {t("Preview")}
                       </Button>
                     </TableCell>
@@ -240,14 +217,14 @@ export function TrafficPickerDialog({
           </div>
           <div className="flex flex-wrap items-center justify-between gap-2">
             <span className="text-sm">
-              {t("{selected} selected · {total} total", { selected: selected.size, total: data?.total ?? 0 })}
+              {t("{selected} selected · {total} total", { selected: selected.size, total })}
             </span>
             <div className="flex items-center gap-2">
               <Button
                 variant="outline"
                 size="sm"
                 disabled={loading || page === 0}
-                onClick={() => setPage((p) => p - 1)}
+                onClick={() => dispatch({ type: "pagination/pageChanged", page: page - 1 })}
               >
                 {t("Previous")}
               </Button>
@@ -255,8 +232,8 @@ export function TrafficPickerDialog({
               <Button
                 variant="outline"
                 size="sm"
-                disabled={loading || (page + 1) * 25 >= (data?.total ?? 0)}
-                onClick={() => setPage((p) => p + 1)}
+                disabled={loading || (page + 1) * PAGE_SIZE >= total}
+                onClick={() => dispatch({ type: "pagination/pageChanged", page: page + 1 })}
               >
                 {t("Next")}
               </Button>
@@ -272,7 +249,7 @@ export function TrafficPickerDialog({
           </DialogFooter>
         </DialogContent>
       </Dialog>
-      <CapturedTrafficViewer id={preview} onClose={() => setPreview(null)} />
+      <CapturedTrafficViewer id={preview} onClose={() => dispatch({ type: "previewChanged", id: null })} />
     </>
   );
 }

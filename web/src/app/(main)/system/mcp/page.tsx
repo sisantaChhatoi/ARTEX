@@ -22,54 +22,32 @@ import {
 import { Tabs, TabsList, TabsTrigger, TabsContent } from "@/components/ui/tabs";
 import { intlLocale, t } from "@/i18n";
 import { api } from "@/lib/api";
-import type { MCPServer, MCPTool, Agent } from "@/lib/types";
+import type { MCPServer } from "@/lib/types";
 
-type Transport = "stdio" | "http" | "sse";
-type FormState = {
-  name: string;
-  transport: Transport;
-  command: string;
-  args: string;
-  url: string;
-  env: string;
-  insecure: boolean;
-  timeoutSeconds: string;
-};
-const emptyForm: FormState = {
-  name: "",
-  transport: "stdio",
-  command: "",
-  args: "",
-  url: "",
-  env: "",
-  insecure: false,
-  timeoutSeconds: "",
-};
+import { type FormState, initialMCPPageState, type MCPEditorTab, mcpPageReducer } from "./_state/mcp-page.reducer";
 
 export default function MCPPage() {
-  const [servers, setServers] = React.useState<MCPServer[]>([]);
-  const [agents, setAgents] = React.useState<Agent[]>([]);
-  const [visibility, setVisibility] = React.useState<Record<number, string[]>>({});
+  const [state, dispatch] = React.useReducer(mcpPageReducer, initialMCPPageState);
+  const { servers, agents, visibility } = state;
 
-  const [open, setOpen] = React.useState(false);
-  const [editing, setEditing] = React.useState<MCPServer | null>(null); // null = add mode
-  const [tab, setTab] = React.useState<"config" | "tools">("config");
-  const [form, setForm] = React.useState<FormState>(emptyForm);
-  const [saving, setSaving] = React.useState(false);
-  const [tools, setTools] = React.useState<MCPTool[]>([]);
-  const [toolsLoading, setToolsLoading] = React.useState(false);
-  const [refreshing, setRefreshing] = React.useState(false);
+  const { open, editing, tab, form } = state.editor; // editing null = add mode
+  const saving = state.requests.save.pending;
+  const { items: tools, loading: toolsLoading } = state.tools;
+  const refreshing = state.requests.refresh.pending;
 
   const load = React.useCallback(() => {
-    api.agents().then(setAgents).catch(() => {});
+    api
+      .agents()
+      .then((agents) => dispatch({ type: "agentsLoaded", agents }))
+      .catch(() => {});
     api
       .mcpServers()
       .then((ss) => {
-        setServers(ss);
+        dispatch({ type: "serversLoaded", servers: ss });
         ss.forEach((s) =>
           api
             .resourceVisibility("mcp", s.id)
-            .then((ids) => setVisibility((v) => ({ ...v, [s.id]: ids })))
+            .then((ids) => dispatch({ type: "visibilityLoaded", serverId: s.id, agentIds: ids }))
             .catch(() => {}),
         );
       })
@@ -80,7 +58,7 @@ export default function MCPPage() {
   }, [load]);
 
   function setF(patch: Partial<FormState>) {
-    setForm((f) => ({ ...f, ...patch }));
+    dispatch({ type: "formFieldChanged", patch });
   }
 
   function parseEnv(text: string): Record<string, string> {
@@ -103,38 +81,35 @@ export default function MCPPage() {
   }
 
   function openAdd() {
-    setEditing(null);
-    setForm(emptyForm);
-    setTools([]);
-    setTab("config");
-    setOpen(true);
+    dispatch({ type: "newServerOpened" });
   }
 
   function openEdit(s: MCPServer) {
-    setEditing(s);
-    setForm({
-      name: s.name,
-      transport: s.transport,
-      command: s.command ?? "",
-      args: (s.args ?? []).join(" "),
-      url: s.url ?? "",
-      env: envToText(s.env),
-      insecure: s.insecure ?? false,
-      timeoutSeconds: s.timeout_seconds ? String(s.timeout_seconds) : "",
+    dispatch({
+      type: "editServerOpened",
+      server: s,
+      form: {
+        name: s.name,
+        transport: s.transport,
+        command: s.command ?? "",
+        args: (s.args ?? []).join(" "),
+        url: s.url ?? "",
+        env: envToText(s.env),
+        insecure: s.insecure ?? false,
+        timeoutSeconds: s.timeout_seconds ? String(s.timeout_seconds) : "",
+      },
     });
-    setTab("config");
-    setOpen(true);
     loadTools(s.id);
   }
 
   async function loadTools(id: number) {
-    setToolsLoading(true);
+    dispatch({ type: "list/loadStarted" });
     try {
-      setTools(await api.mcpTools(id));
+      dispatch({ type: "list/loaded", items: await api.mcpTools(id) });
     } catch {
-      setTools([]);
+      dispatch({ type: "list/loaded", items: [] });
     } finally {
-      setToolsLoading(false);
+      dispatch({ type: "list/loadFinished" });
     }
   }
 
@@ -151,7 +126,7 @@ export default function MCPPage() {
       toast.error(t("Please fill in the remote URL"));
       return;
     }
-    setSaving(true);
+    dispatch({ type: "request/started", key: "save" });
     try {
       const base =
         form.transport !== "stdio"
@@ -180,27 +155,27 @@ export default function MCPPage() {
         ...base,
       });
       toast.success(editing ? t("Saved") : t("MCP server added"));
-      if (!editing) setOpen(false);
+      if (!editing) dispatch({ type: "editorChanged", patch: { open: false } });
       load();
     } catch (e) {
       toast.error(t("Save failed: {error}", { error: (e as Error).message }));
     } finally {
-      setSaving(false);
+      dispatch({ type: "request/finished", key: "save" });
     }
   }
 
   async function refreshTools() {
     if (!editing) return;
-    setRefreshing(true);
+    dispatch({ type: "request/started", key: "refresh" });
     try {
       const found = await api.refreshMcpServer(editing.id);
-      setTools(found);
+      dispatch({ type: "list/loaded", items: found });
       toast.success(t("Found {count} tools", { count: found.length }));
       load();
     } catch (e) {
       toast.error(t("Refresh failed: {error}", { error: (e as Error).message }));
     } finally {
-      setRefreshing(false);
+      dispatch({ type: "request/finished", key: "refresh" });
     }
   }
 
@@ -208,7 +183,7 @@ export default function MCPPage() {
     try {
       await api.deleteMcpServer(s.id);
       toast.success(t("Deleted: {name}", { name: s.name }));
-      setOpen(false);
+      dispatch({ type: "editorChanged", patch: { open: false } });
       load();
     } catch (e) {
       toast.error(t("Delete failed: {error}", { error: (e as Error).message }));
@@ -462,7 +437,7 @@ export default function MCPPage() {
         ))}
       </div>
 
-      <Sheet open={open} onOpenChange={setOpen}>
+      <Sheet open={open} onOpenChange={(next) => dispatch({ type: "editorChanged", patch: { open: next } })}>
         <SheetContent
           side="right"
           className="w-full data-[side=right]:sm:max-w-lg"
@@ -477,7 +452,7 @@ export default function MCPPage() {
           {editing ? (
             <Tabs
               value={tab}
-              onValueChange={(v) => setTab(v as "config" | "tools")}
+              onValueChange={(v) => dispatch({ type: "editorChanged", patch: { tab: v as MCPEditorTab } })}
               className="flex min-h-0 flex-1 flex-col px-4"
             >
               <TabsList>

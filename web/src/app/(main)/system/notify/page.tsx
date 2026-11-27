@@ -17,7 +17,7 @@ import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Textarea } from "@/components/ui/textarea";
 import { t } from "@/i18n";
 import { api } from "@/lib/api";
-import type { NotificationChannel, NotificationFilter, NotificationMeta } from "@/lib/types";
+import type { NotificationChannel, NotificationFilter } from "@/lib/types";
 
 import {
   CHANNEL_FIELDS,
@@ -32,6 +32,7 @@ import {
 import { ConfigField, FilterSummary } from "./_components/channel-form";
 import { DeliveryList } from "./_components/delivery-list";
 import { formatBacklog, StatTile } from "./_components/stat-tile";
+import { initNotifyPageState, type NotifyTab, notifyPageReducer } from "./_state/notify-page.reducer";
 
 // Upper bounds of the two message render limits. They mirror the backend, which answers 400 outside [0, max].
 const SUMMARY_LIMIT_MAX = 4000;
@@ -50,44 +51,39 @@ function limitInvalid(raw: string, max: number): boolean {
 // _components/channel-form.tsx, and the delivery log in _components/delivery-list.tsx —
 // they are split out because each stays readable on its own, whereas crammed into one file this page neared 1100 lines.
 export default function NotifyPage() {
-  const [meta, setMeta] = React.useState<NotificationMeta | null>(null);
-  const [channels, setChannels] = React.useState<NotificationChannel[]>([]);
-  const [tab, setTab] = React.useState<"channels" | "deliveries">("channels");
+  const [state, dispatch] = React.useReducer(notifyPageReducer, emptyForm("dingtalk"), initNotifyPageState);
+  const { meta, channels, tab } = state;
 
-  const [open, setOpen] = React.useState(false);
-  const [editing, setEditing] = React.useState<NotificationChannel | null>(null);
-  const [form, setForm] = React.useState<ChannelForm>(emptyForm("dingtalk"));
-  const [saving, setSaving] = React.useState(false);
-  const [testing, setTesting] = React.useState(false);
+  const { open, editing, form } = state.editor;
+  const saving = state.requests.save.pending;
+  const testing = state.requests.test.pending;
 
-  const [globalSaving, setGlobalSaving] = React.useState(false);
-  const [baseURL, setBaseURL] = React.useState("");
-  const [digestMin, setDigestMin] = React.useState("");
-  const [summaryMax, setSummaryMax] = React.useState("");
-  const [assetsMax, setAssetsMax] = React.useState("");
+  const globalSaving = state.requests.globalSave.pending;
+  const { baseURL, digestMin, summaryMax, assetsMax } = state.globals;
 
   const load = React.useCallback(() => {
     api
       .notifyMeta()
-      .then((m) => {
-        setMeta(m);
-        setBaseURL(m.public_base_url);
-        setDigestMin(m.digest_interval_min);
-      })
+      .then((m) => dispatch({ type: "metaLoaded", meta: m }))
       .catch((e) => toast.error(t("Failed to load notification settings: {error}", { error: (e as Error).message })));
     // The two render limits are not part of /notify/meta; they are only exposed through /api/settings.
     api
       .settings()
-      .then((s) => {
-        setSummaryMax(String(s.notify_summary_max_runes ?? ""));
-        setAssetsMax(String(s.notify_assets_max_shown ?? ""));
-      })
+      .then((s) =>
+        dispatch({
+          type: "globalsChanged",
+          patch: {
+            summaryMax: String(s.notify_summary_max_runes ?? ""),
+            assetsMax: String(s.notify_assets_max_shown ?? ""),
+          },
+        }),
+      )
       .catch((e) => toast.error(t("Failed to load message limits: {error}", { error: (e as Error).message })));
     // Channel-list load failures must be reported: failing silently would render as "no channels at all",
     // and users would think their config was lost — scarier than a straight-up error.
     api
       .notifyChannels()
-      .then(setChannels)
+      .then((channels) => dispatch({ type: "channelsLoaded", channels }))
       .catch((e) => toast.error(t("Failed to load channels: {error}", { error: (e as Error).message })));
   }, []);
   React.useEffect(() => {
@@ -95,39 +91,19 @@ export default function NotifyPage() {
   }, [load]);
 
   function setF(patch: Partial<ChannelForm>) {
-    setForm((f) => ({ ...f, ...patch }));
+    dispatch({ type: "formFieldChanged", patch });
   }
   function setCfg(key: string, value: unknown) {
-    setForm((f) => ({ ...f, config: { ...f.config, [key]: value } }));
+    dispatch({ type: "formConfigChanged", key, value });
   }
 
   function openAdd() {
-    setEditing(null);
-    setForm(emptyForm(meta?.kinds[0]?.kind ?? "dingtalk"));
-    setOpen(true);
+    dispatch({ type: "newChannelOpened", form: emptyForm(meta?.kinds[0]?.kind ?? "dingtalk") });
   }
 
   function openEdit(ch: NotificationChannel) {
-    setEditing(ch);
-    // filter is a Go struct on the backend and always serializes as an object (never null), so no fallback is needed.
-    const f = ch.filter;
-    setForm({
-      name: ch.name,
-      kind: ch.kind,
-      mode: ch.mode,
-      enabled: ch.enabled,
-      ratePerMin: String(ch.rate_per_min),
-      // Credentials in the backend-echoed config are masked values; put them into the form as-is and send them back as-is on submit,
-      // which tells the backend to keep the stored values.
-      config: { ...ch.config },
-      minSeverity: f.min_severity ?? "",
-      includeText: (f.vulnclass_include ?? []).join("\n"),
-      excludeText: (f.vulnclass_exclude ?? []).join("\n"),
-      taskIDsText: (f.task_ids ?? []).join(","),
-      assetIDsText: (f.asset_ids ?? []).join(","),
-      onStatusChange: f.on_status_change ?? false,
-    });
-    setOpen(true);
+    // The reducer maps the channel (config with masked credentials, filter) into the form.
+    dispatch({ type: "editChannelOpened", channel: ch });
   }
 
   // buildConfig turns form state into the channel config.
@@ -191,7 +167,7 @@ export default function NotifyPage() {
       toast.error(t("Please fill in a channel name"));
       return;
     }
-    setSaving(true);
+    dispatch({ type: "request/started", key: "save" });
     try {
       const payload = {
         name: form.name.trim(),
@@ -205,23 +181,23 @@ export default function NotifyPage() {
       if (editing) {
         await api.notifyUpdateChannel(editing.id, payload);
         toast.success(t("Saved"));
-        setOpen(false);
+        dispatch({ type: "editorOpenChanged", open: false });
       } else {
         await api.notifyCreateChannel(payload);
         toast.success(t("Channel added"));
-        setOpen(false);
+        dispatch({ type: "editorOpenChanged", open: false });
       }
       load();
     } catch (e) {
       toast.error(t("Save failed: {error}", { error: (e as Error).message }));
     } finally {
-      setSaving(false);
+      dispatch({ type: "request/finished", key: "save" });
     }
   }
 
   async function testChannel() {
     if (!editing) return;
-    setTesting(true);
+    dispatch({ type: "request/started", key: "test" });
     try {
       const r = await api.notifyTestChannel(editing.id);
       toast.success(t("Test message sent ({ms} ms); check the group to confirm", { ms: r.latency_ms }));
@@ -229,7 +205,7 @@ export default function NotifyPage() {
       // The backend relays the raw error returned by the channel verbatim — the only clue for debugging the config — so show it as-is.
       toast.error(t("Test failed: {error}", { error: (e as Error).message }), { duration: 12000 });
     } finally {
-      setTesting(false);
+      dispatch({ type: "request/finished", key: "test" });
     }
   }
 
@@ -237,7 +213,7 @@ export default function NotifyPage() {
     try {
       await api.notifyDeleteChannel(ch.id);
       toast.success(t("Deleted: {name}", { name: ch.name }));
-      setOpen(false);
+      dispatch({ type: "editorOpenChanged", open: false });
       load();
     } catch (e) {
       toast.error(t("Delete failed: {error}", { error: (e as Error).message }));
@@ -254,15 +230,15 @@ export default function NotifyPage() {
   }
 
   async function toggleGlobal(on: boolean) {
-    setGlobalSaving(true);
+    dispatch({ type: "request/started", key: "globalSave" });
     try {
       await api.setSettings({ notify_enabled: on });
-      setMeta((m) => (m ? { ...m, enabled: on } : m));
+      dispatch({ type: "pushToggled", enabled: on });
       toast.success(on ? t("Push enabled") : t("Push paused"));
     } catch (e) {
       toast.error(t("Operation failed: {error}", { error: (e as Error).message }));
     } finally {
-      setGlobalSaving(false);
+      dispatch({ type: "request/finished", key: "globalSave" });
     }
   }
 
@@ -277,7 +253,7 @@ export default function NotifyPage() {
       toast.error(t("Assets listed must be a whole number between 0 and {max}", { max: ASSETS_LIMIT_MAX }));
       return;
     }
-    setGlobalSaving(true);
+    dispatch({ type: "request/started", key: "globalSave" });
     try {
       const patch: Record<string, unknown> = { notify_public_base_url: baseURL.trim() };
       const n = Number(digestMin);
@@ -290,7 +266,7 @@ export default function NotifyPage() {
     } catch (e) {
       toast.error(t("Save failed: {error}", { error: (e as Error).message }));
     } finally {
-      setGlobalSaving(false);
+      dispatch({ type: "request/finished", key: "globalSave" });
     }
   }
 
@@ -349,7 +325,7 @@ export default function NotifyPage() {
               id="n-base"
               placeholder="https://artex.example.com"
               value={baseURL}
-              onChange={(e) => setBaseURL(e.target.value)}
+              onChange={(e) => dispatch({ type: "globalsChanged", patch: { baseURL: e.target.value } })}
             />
             <p className="text-muted-foreground text-xs">{t("The address the \"View details\" button in messages points to. Leave empty to omit the button.")}</p>
           </div>
@@ -362,7 +338,7 @@ export default function NotifyPage() {
               max={1440}
               placeholder="30"
               value={digestMin}
-              onChange={(e) => setDigestMin(e.target.value)}
+              onChange={(e) => dispatch({ type: "globalsChanged", patch: { digestMin: e.target.value } })}
             />
             <p className="text-muted-foreground text-xs">{t("Only applies to channels in \"digest\" mode.")}</p>
           </div>
@@ -376,7 +352,7 @@ export default function NotifyPage() {
               step={1}
               placeholder="120"
               value={summaryMax}
-              onChange={(e) => setSummaryMax(e.target.value)}
+              onChange={(e) => dispatch({ type: "globalsChanged", patch: { summaryMax: e.target.value } })}
               aria-invalid={limitInvalid(summaryMax, SUMMARY_LIMIT_MAX)}
             />
             <p className="text-muted-foreground text-xs">
@@ -393,7 +369,7 @@ export default function NotifyPage() {
               step={1}
               placeholder="3"
               value={assetsMax}
-              onChange={(e) => setAssetsMax(e.target.value)}
+              onChange={(e) => dispatch({ type: "globalsChanged", patch: { assetsMax: e.target.value } })}
               aria-invalid={limitInvalid(assetsMax, ASSETS_LIMIT_MAX)}
             />
             <p className="text-muted-foreground text-xs">
@@ -408,7 +384,11 @@ export default function NotifyPage() {
         </CardContent>
       </Card>
 
-      <Tabs value={tab} onValueChange={(v) => setTab(v as "channels" | "deliveries")} className="flex flex-col gap-4">
+      <Tabs
+        value={tab}
+        onValueChange={(v) => dispatch({ type: "tabChanged", tab: v as NotifyTab })}
+        className="flex flex-col gap-4"
+      >
         <TabsList>
           <TabsTrigger value="channels">{t("Channels")}</TabsTrigger>
           <TabsTrigger value="deliveries">{t("Delivery log")}</TabsTrigger>
@@ -480,7 +460,7 @@ export default function NotifyPage() {
         </TabsContent>
       </Tabs>
 
-      <Sheet open={open} onOpenChange={setOpen}>
+      <Sheet open={open} onOpenChange={(next) => dispatch({ type: "editorOpenChanged", open: next })}>
         <SheetContent side="right" className="w-full data-[side=right]:sm:max-w-lg">
           <SheetHeader>
             <SheetTitle>{editing ? editing.name : t("Add notification channel")}</SheetTitle>

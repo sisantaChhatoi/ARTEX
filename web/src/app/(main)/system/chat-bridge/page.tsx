@@ -14,29 +14,15 @@ import { Switch } from "@/components/ui/switch";
 import { Textarea } from "@/components/ui/textarea";
 import { t } from "@/i18n";
 import { api } from "@/lib/api";
-import type { ChatBridge, ChatBridgeStatus } from "@/lib/types";
+import type { ChatBridgeStatus } from "@/lib/types";
+
+import { chatBridgePageReducer, initialChatBridgePageState } from "./_state/chat-bridge-page.reducer";
 
 // v1 ships one transport. The page is written against the kind so a second chat app only needs
 // its own fields here; the backend is already transport-agnostic.
 const KIND = "telegram";
 // How often the live status ("bot online") is refreshed while the page is open.
 const STATUS_POLL_MS = 5000;
-
-interface Form {
-  enabled: boolean;
-  token: string; // empty = keep the stored token
-  baseURL: string;
-  chats: string; // one chat ID per line
-}
-
-function formFrom(b: ChatBridge | undefined): Form {
-  return {
-    enabled: b?.enabled ?? false,
-    token: "",
-    baseURL: typeof b?.config.base_url === "string" ? b.config.base_url : "",
-    chats: (b?.allowed_chats ?? []).join("\n"),
-  };
-}
 
 function parseChats(raw: string): string[] {
   return raw
@@ -59,18 +45,15 @@ function StatusBadge({ status }: { status: ChatBridgeStatus }) {
 }
 
 export default function ChatBridgePage() {
-  const [bridge, setBridge] = React.useState<ChatBridge | undefined>();
-  const [form, setForm] = React.useState<Form>(formFrom(undefined));
-  const [loaded, setLoaded] = React.useState(false);
-  const [saving, setSaving] = React.useState(false);
-  const [testing, setTesting] = React.useState(false);
+  const [state, dispatch] = React.useReducer(chatBridgePageReducer, initialChatBridgePageState);
+  const { bridge, form, loaded } = state;
+  const saving = state.requests.save.pending;
+  const testing = state.requests.test.pending;
 
   const load = React.useCallback(async (resetForm: boolean) => {
     const list = await api.chatBridges();
     const b = list.find((x) => x.kind === KIND);
-    setBridge(b);
-    if (resetForm) setForm(formFrom(b));
-    setLoaded(true);
+    dispatch({ type: "bridgeLoaded", bridge: b, resetForm });
   }, []);
 
   React.useEffect(() => {
@@ -92,32 +75,31 @@ export default function ChatBridgePage() {
     const config: Record<string, unknown> = { base_url: form.baseURL.trim() };
     // An empty token field keeps the stored token: the masked value tells the server "unchanged".
     config.bot_token = form.token.trim() || storedToken;
-    setSaving(true);
+    dispatch({ type: "request/started", key: "save" });
     try {
       const saved = await api.chatBridgeSave(KIND, {
         enabled: form.enabled,
         config,
         allowed_chats: parseChats(form.chats),
       });
-      setBridge(saved);
-      setForm(formFrom(saved));
+      dispatch({ type: "bridgeSaved", bridge: saved });
       toast.success(t("Saved"));
     } catch (e) {
       toast.error(t("Save failed: {error}", { error: (e as Error).message }));
     } finally {
-      setSaving(false);
+      dispatch({ type: "request/finished", key: "save" });
     }
   }
 
   async function test() {
-    setTesting(true);
+    dispatch({ type: "request/started", key: "test" });
     try {
       const r = await api.chatBridgeTest(KIND);
       toast.success(t("Connected to @{bot} in {ms} ms", { bot: r.bot.username, ms: String(r.latency_ms) }));
     } catch (e) {
       toast.error(t("Connection test failed: {error}", { error: (e as Error).message }));
     } finally {
-      setTesting(false);
+      dispatch({ type: "request/finished", key: "test" });
     }
   }
 
@@ -172,7 +154,7 @@ export default function ChatBridgePage() {
               id="cb-enabled"
               checked={form.enabled}
               disabled={!loaded}
-              onCheckedChange={(v) => setForm((f) => ({ ...f, enabled: v }))}
+              onCheckedChange={(v) => dispatch({ type: "formChanged", patch: { enabled: v } })}
             />
             <Label htmlFor="cb-enabled">{t("Enabled")}</Label>
           </div>
@@ -191,7 +173,7 @@ export default function ChatBridgePage() {
                   : "123456789:AA…"
               }
               value={form.token}
-              onChange={(e) => setForm((f) => ({ ...f, token: e.target.value }))}
+              onChange={(e) => dispatch({ type: "formChanged", patch: { token: e.target.value } })}
             />
             <p className="text-muted-foreground text-xs">
               {t(
@@ -208,7 +190,7 @@ export default function ChatBridgePage() {
               className="font-mono"
               placeholder={"123456789\n-1001234567890"}
               value={form.chats}
-              onChange={(e) => setForm((f) => ({ ...f, chats: e.target.value }))}
+              onChange={(e) => dispatch({ type: "formChanged", patch: { chats: e.target.value } })}
             />
             <p className="text-muted-foreground text-xs">
               {t(
@@ -230,7 +212,7 @@ export default function ChatBridgePage() {
               id="cb-base"
               placeholder="https://api.telegram.org"
               value={form.baseURL}
-              onChange={(e) => setForm((f) => ({ ...f, baseURL: e.target.value }))}
+              onChange={(e) => dispatch({ type: "formChanged", patch: { baseURL: e.target.value } })}
             />
             <p className="text-muted-foreground text-xs">
               {t("Only for a self-hosted Bot API server or a relay. Changing it requires entering the token again.")}

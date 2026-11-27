@@ -5,6 +5,16 @@ import * as React from "react";
 import { LibraryIcon, PlusIcon, SaveIcon, Settings2Icon, Trash2Icon } from "lucide-react";
 import { toast } from "sonner";
 
+import {
+  initialTaskTemplateControlsState,
+  taskTemplateControlsReducer,
+} from "@/components/_state/task-template-controls.reducer";
+import {
+  initialTaskTemplateManagerState,
+  type TemplateDraft,
+  type TemplateSeed,
+  taskTemplateManagerReducer,
+} from "@/components/_state/task-template-manager.reducer";
 import { AssetInterceptRulesEditor } from "@/components/asset-intercept-rules-editor";
 import {
   AlertDialog,
@@ -33,20 +43,9 @@ import { Sheet, SheetContent, SheetDescription, SheetFooter, SheetHeader, SheetT
 import { Spinner } from "@/components/ui/spinner";
 import { Textarea } from "@/components/ui/textarea";
 import { api } from "@/lib/api";
-import type { AssetInterceptRuleInput, TaskCategory, TaskTemplate } from "@/lib/types";
+import type { AssetInterceptRuleInput, TaskTemplate } from "@/lib/types";
 import { t } from "@/i18n";
 import { cn } from "@/lib/utils";
-
-interface TemplateDraft {
-  name: string;
-  description: string;
-  goal: string;
-  categoryID: number | null;
-  interceptRules: AssetInterceptRuleInput[];
-}
-
-// TemplateSeed holds the initial values carried over from the creation form when using "Save as template".
-type TemplateSeed = Pick<TemplateDraft, "description" | "goal" | "categoryID" | "interceptRules">;
 
 interface TaskTemplateManagerProps {
   open: boolean;
@@ -58,24 +57,6 @@ interface TaskTemplateManagerProps {
   onDeleted: (id: number) => void;
 }
 
-const emptyDraft = (): TemplateDraft => ({
-  name: "",
-  description: "",
-  goal: "",
-  categoryID: null,
-  interceptRules: [],
-});
-
-function templateDraft(template: TaskTemplate): TemplateDraft {
-  return {
-    name: template.name,
-    description: template.description,
-    goal: template.goal,
-    categoryID: template.category_id ?? null,
-    interceptRules: template.intercept_rules ?? [],
-  };
-}
-
 function TaskTemplateManager({
   open,
   onOpenChange,
@@ -85,60 +66,40 @@ function TaskTemplateManager({
   onUpdated,
   onDeleted,
 }: TaskTemplateManagerProps) {
-  const [selectedID, setSelectedID] = React.useState<number | null>(null);
-  const [draft, setDraft] = React.useState<TemplateDraft>(emptyDraft);
-  const [saving, setSaving] = React.useState(false);
-  const [deleteOpen, setDeleteOpen] = React.useState(false);
-  const [deleting, setDeleting] = React.useState(false);
-  const [categories, setCategories] = React.useState<TaskCategory[]>([]);
+  const [state, dispatch] = React.useReducer(taskTemplateManagerReducer, initialTaskTemplateManagerState);
+  const { selectedID, draft } = state.editor;
+  const { categories, deleteOpen } = state;
+  const saving = state.requests.save.pending;
+  const deleting = state.requests.delete.pending;
   const wasOpen = React.useRef(false);
 
   React.useEffect(() => {
     if (!open) return;
     api
       .taskCategories()
-      .then(setCategories)
-      .catch(() => setCategories([]));
+      .then((loaded) => dispatch({ type: "categoriesLoaded", categories: loaded }))
+      .catch(() => dispatch({ type: "categoriesLoaded", categories: [] }));
   }, [open]);
 
   React.useEffect(() => {
-    if (open && !wasOpen.current) {
-      if (seed) {
-        setSelectedID(null);
-        setDraft({
-          name: "",
-          description: seed.description,
-          goal: seed.goal,
-          categoryID: seed.categoryID,
-          interceptRules: seed.interceptRules,
-        });
-      } else if (templates[0]) {
-        setSelectedID(templates[0].id);
-        setDraft(templateDraft(templates[0]));
-      } else {
-        setSelectedID(null);
-        setDraft(emptyDraft());
-      }
-    }
+    if (open && !wasOpen.current) dispatch({ type: "managerOpened", seed, templates });
     wasOpen.current = open;
   }, [open, seed, templates]);
 
   const selectTemplate = (template: TaskTemplate) => {
-    setSelectedID(template.id);
-    setDraft(templateDraft(template));
+    dispatch({ type: "templateSelected", template });
   };
 
   const startNew = () => {
-    setSelectedID(null);
-    setDraft(emptyDraft());
+    dispatch({ type: "newStarted" });
   };
 
   const updateDraft = (field: "name" | "description" | "goal", value: string) => {
-    setDraft((current) => ({ ...current, [field]: value }));
+    dispatch({ type: "draftChanged", patch: { [field]: value } });
   };
 
   const patchDraft = (patch: Partial<TemplateDraft>) => {
-    setDraft((current) => ({ ...current, ...patch }));
+    dispatch({ type: "draftChanged", patch });
   };
 
   async function save() {
@@ -155,47 +116,39 @@ function TaskTemplateManager({
       toast.error(t("Fill in the template name, description, and goal"));
       return;
     }
-    setSaving(true);
+    dispatch({ type: "request/started", key: "save" });
     try {
       if (selectedID == null) {
         const created = await api.createTaskTemplate(input);
         onCreated(created);
-        setSelectedID(created.id);
-        setDraft(templateDraft(created));
+        dispatch({ type: "templateCreated", template: created });
         toast.success(t("Template created"));
       } else {
         const updated = await api.updateTaskTemplate(selectedID, input);
         onUpdated(updated);
-        setDraft(templateDraft(updated));
+        dispatch({ type: "templateUpdated", template: updated });
         toast.success(t("Template updated"));
       }
     } catch (error) {
       toast.error(t("Save failed: {error}", { error: (error as Error).message }));
     } finally {
-      setSaving(false);
+      dispatch({ type: "request/finished", key: "save" });
     }
   }
 
   async function remove() {
     if (selectedID == null) return;
     const deletedID = selectedID;
-    setDeleting(true);
+    dispatch({ type: "request/started", key: "delete" });
     try {
       await api.deleteTaskTemplate(deletedID);
       onDeleted(deletedID);
-      const next = templates.find((template) => template.id !== deletedID);
-      if (next) {
-        setSelectedID(next.id);
-        setDraft(templateDraft(next));
-      } else {
-        startNew();
-      }
-      setDeleteOpen(false);
+      dispatch({ type: "templateDeleted", id: deletedID, templates });
       toast.success(t("Template deleted"));
     } catch (error) {
       toast.error(t("Delete failed: {error}", { error: (error as Error).message }));
     } finally {
-      setDeleting(false);
+      dispatch({ type: "request/finished", key: "delete" });
     }
   }
 
@@ -308,7 +261,12 @@ function TaskTemplateManager({
           </div>
           <SheetFooter className="border-t px-6 py-4 sm:flex-row sm:items-center">
             {selectedID != null && (
-              <Button type="button" variant="destructive" className="sm:mr-auto" onClick={() => setDeleteOpen(true)}>
+              <Button
+                type="button"
+                variant="destructive"
+                className="sm:mr-auto"
+                onClick={() => dispatch({ type: "deleteOpenChanged", open: true })}
+              >
                 <Trash2Icon data-icon="inline-start" />
                 {t("Delete template")}
               </Button>
@@ -323,7 +281,10 @@ function TaskTemplateManager({
           </SheetFooter>
         </SheetContent>
       </Sheet>
-      <AlertDialog open={deleteOpen} onOpenChange={setDeleteOpen}>
+      <AlertDialog
+        open={deleteOpen}
+        onOpenChange={(nextOpen) => dispatch({ type: "deleteOpenChanged", open: nextOpen })}
+      >
         <AlertDialogContent>
           <AlertDialogHeader>
             <AlertDialogTitle>{t('Delete template "{name}"?', { name: draft.name || t("Untitled template") })}</AlertDialogTitle>
@@ -370,22 +331,20 @@ export function TaskTemplateControls({
   onApply,
   portalContainer,
 }: TaskTemplateControlsProps) {
-  const [templates, setTemplates] = React.useState<TaskTemplate[]>([]);
-  const [loading, setLoading] = React.useState(true);
-  const [templateInputValue, setTemplateInputValue] = React.useState("");
-  const [pendingTemplate, setPendingTemplate] = React.useState<TaskTemplate | null>(null);
-  const [managerOpen, setManagerOpen] = React.useState(false);
-  const [managerSeed, setManagerSeed] = React.useState<TemplateSeed | null>(null);
+  const [state, dispatch] = React.useReducer(taskTemplateControlsReducer, initialTaskTemplateControlsState);
+  const { items: templates, loading } = state.templates;
+  const { inputValue: templateInputValue, pending: pendingTemplate } = state.picker;
+  const { open: managerOpen, seed: managerSeed } = state.manager;
 
   const loadTemplates = React.useCallback(async () => {
-    setLoading(true);
+    dispatch({ type: "list/loadStarted" });
     try {
-      setTemplates(await api.taskTemplates());
+      dispatch({ type: "list/loaded", items: await api.taskTemplates() });
     } catch (error) {
-      setTemplates([]);
+      dispatch({ type: "list/loaded", items: [] });
       toast.error(t("Failed to load templates: {error}", { error: (error as Error).message }));
     } finally {
-      setLoading(false);
+      dispatch({ type: "list/loadFinished" });
     }
   }, []);
 
@@ -399,42 +358,41 @@ export function TaskTemplateControls({
   );
 
   React.useEffect(() => {
-    setTemplateInputValue(selectedTemplate?.name ?? "");
+    dispatch({ type: "inputValueChanged", value: selectedTemplate?.name ?? "" });
   }, [selectedTemplate]);
 
   const applyTemplate = (template: TaskTemplate) => {
     onApply(template);
     onSelectedTemplateIDChange(template.id);
-    setPendingTemplate(null);
+    dispatch({ type: "confirmClosed" });
   };
 
   const chooseTemplate = (template: TaskTemplate | null) => {
     if (!template) {
-      setTemplateInputValue("");
+      dispatch({ type: "inputValueChanged", value: "" });
       onSelectedTemplateIDChange(null);
       return;
     }
-    setTemplateInputValue(template.name);
+    dispatch({ type: "inputValueChanged", value: template.name });
     const hasContent = description.trim() !== "" || goal.trim() !== "";
     const changesContent = description !== template.description || goal !== template.goal;
     if (hasContent && changesContent) {
-      setPendingTemplate(template);
+      dispatch({ type: "confirmRequested", template });
       return;
     }
     applyTemplate(template);
   };
 
   const openManager = (seed: TemplateSeed | null) => {
-    setManagerSeed(seed);
-    setManagerOpen(true);
+    dispatch({ type: "managerOpened", seed });
   };
 
   const upsertTemplate = (template: TaskTemplate) => {
-    setTemplates((current) => [template, ...current.filter((item) => item.id !== template.id)]);
+    dispatch({ type: "templateUpserted", template });
   };
 
   const deleteTemplate = (id: number) => {
-    setTemplates((current) => current.filter((template) => template.id !== id));
+    dispatch({ type: "templateRemoved", id });
     if (selectedTemplateID === id) onSelectedTemplateIDChange(null);
   };
 
@@ -475,7 +433,7 @@ export function TaskTemplateControls({
           itemToStringLabel={(template) => template.name}
           itemToStringValue={(template) => String(template.id)}
           inputValue={templateInputValue}
-          onInputValueChange={(value) => setTemplateInputValue(value)}
+          onInputValueChange={(value) => dispatch({ type: "inputValueChanged", value })}
           value={selectedTemplate}
           onValueChange={chooseTemplate}
         >
@@ -514,8 +472,7 @@ export function TaskTemplateControls({
         open={pendingTemplate != null}
         onOpenChange={(open) => {
           if (open) return;
-          setPendingTemplate(null);
-          setTemplateInputValue(selectedTemplate?.name ?? "");
+          dispatch({ type: "confirmDismissed", inputValue: selectedTemplate?.name ?? "" });
         }}
       >
         <AlertDialogContent>
@@ -536,7 +493,7 @@ export function TaskTemplateControls({
 
       <TaskTemplateManager
         open={managerOpen}
-        onOpenChange={setManagerOpen}
+        onOpenChange={(open) => dispatch({ type: "managerOpenChanged", open })}
         templates={templates}
         seed={managerSeed}
         onCreated={upsertTemplate}

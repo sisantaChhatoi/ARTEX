@@ -28,10 +28,17 @@ import { Switch } from "@/components/ui/switch";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { t } from "@/i18n";
 import { api } from "@/lib/api";
-import type { LLMPoolMember, LLMPoolStatus, LLMProfile, LLMRetryOverride } from "@/lib/types";
+import type { LLMPoolMember, LLMPoolStatus, LLMProfile } from "@/lib/types";
 import { cn } from "@/lib/utils";
 
 import { ProfileRetryFields, RetryPolicyPanel, ZERO_OVERRIDE } from "./_components/retry";
+import { initialLLMPageState, llmPageReducer } from "./_state/llm-page.reducer";
+import {
+  createProfileSheetState,
+  type ProfileForm,
+  type ProfileFormat,
+  profileSheetReducer,
+} from "./_state/profile-sheet.reducer";
 import { setVisibleInterval } from "@/lib/polling";
 
 // Renders a translated string, turning <b>…</b> spans into bold elements, so a sentence with emphasis stays one key.
@@ -65,9 +72,6 @@ const MAX_TOKENS_FIELD_HINTS: Record<string, string> = {
   "openai-responses": t("Only selectable for the openai format. The Responses API's field name is fixed as max_output_tokens."),
   ollama: t("Only selectable for the openai format. Ollama's field name is fixed as max_tokens."),
 };
-// LLM profile formats. The default in the create form is "anthropic"; "ollama" is the
-// keyless local-server format (base URL defaults to http://127.0.0.1:11434/v1).
-type ProfileFormat = "anthropic" | "openai" | "openai-responses" | "ollama" | "bedrock-gateway";
 const OLLAMA_DEFAULT_BASE_URL = "http://127.0.0.1:11434/v1";
 const EFFORT_LEVELS: { value: string; label: string }[] = [
   { value: NONE, label: t("Not sent (default)") },
@@ -323,6 +327,45 @@ function PoolSheet({
 // Model profile drawer (create / edit share the same form)
 // ─────────────────────────────────────────────────────────────────────────────
 
+// profileFormOf fills the drawer's form from a profile, or with the create defaults when profile is null.
+function profileFormOf(profile: LLMProfile | null): ProfileForm {
+  return {
+    name: profile?.name ?? "",
+    format:
+      profile?.format === "openai" ||
+      profile?.format === "openai-responses" ||
+      profile?.format === "ollama" ||
+      profile?.format === "bedrock-gateway"
+        ? profile.format
+        : "anthropic",
+    model: profile?.model ?? "",
+    baseUrl: profile?.base_url ?? "",
+    proxy: profile?.proxy ?? "",
+    apiKey: "",
+    rps: String(profile?.rate_per_second ?? 0),
+    rpm: String(profile?.rate_per_minute ?? 0),
+    cw: String(profile?.context_window_k ?? 0),
+    prices: {
+      input: String(profile?.price_input_per_m ?? 0),
+      output: String(profile?.price_output_per_m ?? 0),
+      cacheRead: String(profile?.price_cache_read_per_m ?? 0),
+      cacheWrite: String(profile?.price_cache_write_per_m ?? 0),
+    },
+    thinkingType: fromStore(profile?.thinking_type),
+    effort: fromStore(profile?.reasoning_effort),
+    priority: String(profile?.priority ?? 0),
+    poolExclude: profile?.pool_exclude ?? false,
+    streaming: profile?.streaming ?? true,
+    maxTokens: String(profile?.max_tokens ?? 0),
+    maxTokensField: fromStore(profile?.max_tokens_field),
+    sessionHeaderKey: profile?.session_header_key ?? "",
+    userAgent: profile?.user_agent ?? "",
+    customHeaders: "",
+    clearCustomHeaders: false,
+    retry: profile?.retry ?? ZERO_OVERRIDE,
+  };
+}
+
 function ProfileSheet({
   profile,
   open,
@@ -335,75 +378,46 @@ function ProfileSheet({
   onSaved: (id: string) => void;
 }) {
   const isNew = !profile;
-  const [name, setName] = React.useState("");
-  const [format, setFormat] = React.useState<ProfileFormat>("anthropic");
-  const [model, setModel] = React.useState("");
-  const [baseUrl, setBaseUrl] = React.useState("");
-  const [proxy, setProxy] = React.useState("");
-  const [apiKey, setApiKey] = React.useState("");
-  const [keyHint, setKeyHint] = React.useState("");
-  const [rps, setRps] = React.useState("0");
-  const [rpm, setRpm] = React.useState("0");
-  const [cw, setCw] = React.useState("0"); // context window (K tokens); 0 = default 200K
-  const [prices, setPrices] = React.useState({ input: "0", output: "0", cacheRead: "0", cacheWrite: "0" }); // EUR per 1M tokens; 0 = unset
-  const [thinkingType, setThinkingType] = React.useState(NONE);
-  const [effort, setEffort] = React.useState(NONE);
-  const [priority, setPriority] = React.useState("0"); // pool order; higher = tried earlier
-  const [poolExclude, setPoolExclude] = React.useState(false);
-  const [streaming, setStreaming] = React.useState(true); // true = streaming (default); false = non-streaming
-  const [maxTokens, setMaxTokens] = React.useState("0"); // per-reply output cap; 0 = not sent
-  const [maxTokensField, setMaxTokensField] = React.useState(NONE); // which field name carries the cap; NONE = max_tokens
-  const [sessionHeaderKey, setSessionHeaderKey] = React.useState(""); // custom session header name; empty = not sent
-  const [userAgent, setUserAgent] = React.useState(""); // custom User-Agent; empty = keep the default UA
-  const [customHeaders, setCustomHeaders] = React.useState("");
-  const [clearCustomHeaders, setClearCustomHeaders] = React.useState(false);
-  const [retry, setRetry] = React.useState<LLMRetryOverride>(ZERO_OVERRIDE); // retry override for this profile; all 0 = follow the global
-  const [testing, setTesting] = React.useState(false);
-  const [saving, setSaving] = React.useState(false);
-  const [models, setModels] = React.useState<string[]>([]);
-  const [loadingModels, setLoadingModels] = React.useState(false);
-  const [modelsOpen, setModelsOpen] = React.useState(false);
-  const [modelQuery, setModelQuery] = React.useState(""); // filter text for the loaded model list; reset on open/close
+  const [state, dispatch] = React.useReducer(profileSheetReducer, null, () =>
+    createProfileSheetState(profileFormOf(null), ""),
+  );
+  const { form, keyHint } = state;
+  const {
+    name,
+    format,
+    model,
+    baseUrl,
+    proxy,
+    apiKey,
+    rps,
+    rpm,
+    cw,
+    prices,
+    thinkingType,
+    effort,
+    priority,
+    poolExclude,
+    streaming,
+    maxTokens,
+    maxTokensField,
+    sessionHeaderKey,
+    userAgent,
+    customHeaders,
+    clearCustomHeaders,
+    retry,
+  } = form;
+  const { items: models, open: modelsOpen, query: modelQuery } = state.models;
+  const testing = state.requests.test.pending;
+  const saving = state.requests.save.pending;
+  const loadingModels = state.requests.models.pending;
+  const setField = (patch: Partial<Omit<ProfileForm, "customHeaders" | "clearCustomHeaders">>) =>
+    dispatch({ type: "formFieldChanged", patch });
 
   // Every time it opens, the form is re-filled from the passed-in profile (reset to defaults when creating). Closing and reopening
   // the drawer is a clean start, leaving no leftovers from the previous profile.
   React.useEffect(() => {
     if (!open) return;
-    setName(profile?.name ?? "");
-    setFormat(
-      profile?.format === "openai" || profile?.format === "openai-responses" || profile?.format === "ollama" || profile?.format === "bedrock-gateway"
-        ? profile.format
-        : "anthropic",
-    );
-    setModel(profile?.model ?? "");
-    setBaseUrl(profile?.base_url ?? "");
-    setProxy(profile?.proxy ?? "");
-    setRps(String(profile?.rate_per_second ?? 0));
-    setRpm(String(profile?.rate_per_minute ?? 0));
-    setCw(String(profile?.context_window_k ?? 0));
-    setPrices({
-      input: String(profile?.price_input_per_m ?? 0),
-      output: String(profile?.price_output_per_m ?? 0),
-      cacheRead: String(profile?.price_cache_read_per_m ?? 0),
-      cacheWrite: String(profile?.price_cache_write_per_m ?? 0),
-    });
-    setThinkingType(fromStore(profile?.thinking_type));
-    setEffort(fromStore(profile?.reasoning_effort));
-    setPriority(String(profile?.priority ?? 0));
-    setPoolExclude(profile?.pool_exclude ?? false);
-    setStreaming(profile?.streaming ?? true);
-    setMaxTokens(String(profile?.max_tokens ?? 0));
-    setMaxTokensField(fromStore(profile?.max_tokens_field));
-    setSessionHeaderKey(profile?.session_header_key ?? "");
-    setUserAgent(profile?.user_agent ?? "");
-    setCustomHeaders("");
-    setClearCustomHeaders(false);
-    setRetry(profile?.retry ?? ZERO_OVERRIDE);
-    setApiKey("");
-    setKeyHint(profile?.api_key_hint ?? "");
-    setModels([]);
-    setModelsOpen(false);
-    setModelQuery("");
+    dispatch({ type: "opened", form: profileFormOf(profile), keyHint: profile?.api_key_hint ?? "" });
   }, [open, profile]);
 
   const profileId = profile ? Number(profile.id) : undefined;
@@ -418,14 +432,11 @@ function ProfileSheet({
 
   async function loadModels() {
     if (loadingModels) return;
-    setLoadingModels(true);
-    setModels([]);
-    setModelQuery("");
+    dispatch({ type: "modelsLoadStarted" });
     try {
       const r = await api.fetchLLMModels(format, baseUrl, apiKey, proxy, profileId);
       if (r.ok && r.models && r.models.length > 0) {
-        setModels(r.models);
-        setModelsOpen(true);
+        dispatch({ type: "modelsLoaded", models: r.models });
         toast.success(t("Loaded {count} models", { count: r.models.length }));
       } else {
         toast.error(t("Failed to load models: {error}", { error: r.error ?? t("no models returned") }));
@@ -433,13 +444,13 @@ function ProfileSheet({
     } catch (e) {
       toast.error(t("Error loading models: {error}", { error: (e as Error).message }));
     } finally {
-      setLoadingModels(false);
+      dispatch({ type: "request/finished", key: "models" });
     }
   }
 
   async function testConnection() {
     if (testing) return;
-    setTesting(true);
+    dispatch({ type: "request/started", key: "test" });
     try {
       // Test with the thinking parameters the profile would actually run, so a model that does not support the field fails here,
       // not when a task is already running. Pass the profile id: with the Key input left empty, the stored Key is used.
@@ -468,7 +479,7 @@ function ProfileSheet({
     } catch (e) {
       toast.error(t("Test error: {error}", { error: (e as Error).message }));
     } finally {
-      setTesting(false);
+      dispatch({ type: "request/finished", key: "test" });
     }
   }
 
@@ -478,7 +489,7 @@ function ProfileSheet({
       return;
     }
     if (saving) return;
-    setSaving(true);
+    dispatch({ type: "request/started", key: "save" });
     try {
       const { id } = await api.saveLLMProfile({
         ...(profile ? { id: Number(profile.id) } : {}),
@@ -520,7 +531,7 @@ function ProfileSheet({
     } catch (e) {
       toast.error(t("Save failed: {error}", { error: (e as Error).message }));
     } finally {
-      setSaving(false);
+      dispatch({ type: "request/finished", key: "save" });
     }
   }
 
@@ -569,12 +580,12 @@ function ProfileSheet({
                 id="p-name"
                 placeholder={t("e.g. OpenAI production")}
                 value={name}
-                onChange={(e) => setName(e.target.value)}
+                onChange={(e) => setField({ name: e.target.value })}
               />
             </div>
             <div className="grid gap-2">
               <Label>{t("Format")}</Label>
-              <Select value={format} onValueChange={(v) => setFormat(v as ProfileFormat)}>
+              <Select value={format} onValueChange={(v) => setField({ format: v as ProfileFormat })}>
                 <SelectTrigger>
                   <SelectValue placeholder={t("Select a format")} />
                 </SelectTrigger>
@@ -597,18 +608,11 @@ function ProfileSheet({
                 className="font-mono"
                 placeholder={format === "ollama" ? "llama3.2" : "claude-opus-4-8"}
                 value={model}
-                onChange={(e) => setModel(e.target.value)}
+                onChange={(e) => setField({ model: e.target.value })}
               />
               {/* modal: this Popover's content is portaled to <body>, outside the Sheet's scroll lock,
                   so without modal the list renders but cannot scroll. modal lets it hold the topmost scroll lock itself. */}
-              <Popover
-                open={modelsOpen}
-                onOpenChange={(o) => {
-                  setModelsOpen(o);
-                  if (!o) setModelQuery("");
-                }}
-                modal
-              >
+              <Popover open={modelsOpen} onOpenChange={(o) => dispatch({ type: "modelsOpenChanged", open: o })} modal>
                 <PopoverTrigger asChild>
                   <Button
                     type="button"
@@ -630,7 +634,7 @@ function ProfileSheet({
                         className="h-8 border-0 shadow-none focus-visible:ring-0 dark:bg-transparent"
                         placeholder={t("Search {count} models…", { count: models.length })}
                         value={modelQuery}
-                        onChange={(e) => setModelQuery(e.target.value)}
+                        onChange={(e) => dispatch({ type: "modelQueryChanged", query: e.target.value })}
                         spellCheck={false}
                         aria-label={t("Search models")}
                       />
@@ -646,10 +650,7 @@ function ProfileSheet({
                             key={m}
                             type="button"
                             className="w-full shrink-0 rounded-md px-2 py-1.5 text-left font-mono text-xs hover:bg-accent hover:text-accent-foreground"
-                            onClick={() => {
-                              setModel(m);
-                              setModelsOpen(false);
-                            }}
+                            onClick={() => dispatch({ type: "modelPicked", model: m })}
                           >
                             {m}
                           </button>
@@ -669,16 +670,32 @@ function ProfileSheet({
               className="font-mono"
               placeholder={basePlaceholder}
               value={baseUrl}
-              onChange={(e) => setBaseUrl(e.target.value)}
+              onChange={(e) => setField({ baseUrl: e.target.value })}
             />
           </div>
 
           {format === "bedrock-gateway" && (
             <div className="grid gap-2">
               <Label htmlFor="p-custom-headers">Custom gateway headers (optional)</Label>
-              <textarea id="p-custom-headers" className="min-h-20 w-full rounded-md border bg-background px-3 py-2 font-mono text-sm" placeholder="X-Example-Route: demo" value={customHeaders} onChange={(e) => { setCustomHeaders(e.target.value); setClearCustomHeaders(false); }} spellCheck={false} />
+              <textarea
+                id="p-custom-headers"
+                className="min-h-20 w-full rounded-md border bg-background px-3 py-2 font-mono text-sm"
+                placeholder="X-Example-Route: demo"
+                value={customHeaders}
+                onChange={(e) => dispatch({ type: "customHeadersChanged", customHeaders: e.target.value })}
+                spellCheck={false}
+              />
               <p className="text-muted-foreground text-xs">One Name: Value per line. Values are encrypted and cannot be viewed after saving. Leave blank to keep saved headers.</p>
-              {profile?.custom_headers_set && <label className="flex items-center gap-2 text-sm"><input type="checkbox" checked={clearCustomHeaders} onChange={(e) => { setClearCustomHeaders(e.target.checked); if (e.target.checked) setCustomHeaders(""); }} />Clear saved custom headers</label>}
+              {profile?.custom_headers_set && (
+                <label className="flex items-center gap-2 text-sm">
+                  <input
+                    type="checkbox"
+                    checked={clearCustomHeaders}
+                    onChange={(e) => dispatch({ type: "clearCustomHeadersChanged", clear: e.target.checked })}
+                  />
+                  Clear saved custom headers
+                </label>
+              )}
             </div>
           )}
 
@@ -689,7 +706,7 @@ function ProfileSheet({
               className="font-mono"
               placeholder="socks5://user:pass@127.0.0.1:1080 · http://127.0.0.1:8080"
               value={proxy}
-              onChange={(e) => setProxy(e.target.value)}
+              onChange={(e) => setField({ proxy: e.target.value })}
             />
             <p className="text-muted-foreground text-xs">
               {t(
@@ -705,7 +722,7 @@ function ProfileSheet({
               className="font-mono"
               placeholder={t("e.g. x-session-id (empty = not sent)")}
               value={sessionHeaderKey}
-              onChange={(e) => setSessionHeaderKey(e.target.value)}
+              onChange={(e) => setField({ sessionHeaderKey: e.target.value })}
             />
             <p className="text-muted-foreground text-xs">
               {rich(
@@ -723,7 +740,7 @@ function ProfileSheet({
               className="font-mono"
               placeholder={t("e.g. my-app/1.0 (empty = default UA)")}
               value={userAgent}
-              onChange={(e) => setUserAgent(e.target.value)}
+              onChange={(e) => setField({ userAgent: e.target.value })}
             />
             <p className="text-muted-foreground text-xs">
               {rich(
@@ -743,7 +760,7 @@ function ProfileSheet({
               type="password"
               placeholder={keyPlaceholder}
               value={apiKey}
-              onChange={(e) => setApiKey(e.target.value)}
+              onChange={(e) => setField({ apiKey: e.target.value })}
               // A masked field with no autocomplete hint looks like this site's
               // login password: password managers fill it and Save persists the
               // wrong secret over the stored key. new-password keeps them out.
@@ -757,11 +774,11 @@ function ProfileSheet({
           <div className="grid gap-4 sm:grid-cols-3">
             <div className="grid gap-2">
               <Label htmlFor="p-rps">{t("Rate limit per second")}</Label>
-              <Input id="p-rps" type="number" min={0} value={rps} onChange={(e) => setRps(e.target.value)} />
+              <Input id="p-rps" type="number" min={0} value={rps} onChange={(e) => setField({ rps: e.target.value })} />
             </div>
             <div className="grid gap-2">
               <Label htmlFor="p-rpm">{t("Rate limit per minute")}</Label>
-              <Input id="p-rpm" type="number" min={0} value={rpm} onChange={(e) => setRpm(e.target.value)} />
+              <Input id="p-rpm" type="number" min={0} value={rpm} onChange={(e) => setField({ rpm: e.target.value })} />
             </div>
             <div className="grid gap-2">
               <Label htmlFor="p-cw">{t("Context window (K)")}</Label>
@@ -771,7 +788,7 @@ function ProfileSheet({
                 min={0}
                 max={1000}
                 value={cw}
-                onChange={(e) => setCw(e.target.value)}
+                onChange={(e) => setField({ cw: e.target.value })}
                 placeholder="200"
               />
             </div>
@@ -799,7 +816,7 @@ function ProfileSheet({
                   min={0}
                   step="any"
                   value={prices[key]}
-                  onChange={(e) => setPrices((p) => ({ ...p, [key]: e.target.value }))}
+                  onChange={(e) => setField({ prices: { ...prices, [key]: e.target.value } })}
                 />
               </div>
             ))}
@@ -825,7 +842,7 @@ function ProfileSheet({
                 type="number"
                 className="w-24 shrink-0"
                 value={priority}
-                onChange={(e) => setPriority(e.target.value)}
+                onChange={(e) => setField({ priority: e.target.value })}
               />
             </div>
             <div className="flex items-center justify-between gap-4 border-t pt-3">
@@ -837,7 +854,11 @@ function ProfileSheet({
                   )}
                 </p>
               </div>
-              <Switch checked={poolExclude} onCheckedChange={setPoolExclude} aria-label={t("Excluded from pool")} />
+              <Switch
+                checked={poolExclude}
+                onCheckedChange={(v) => setField({ poolExclude: v })}
+                aria-label={t("Excluded from pool")}
+              />
             </div>
             <div className="flex items-center justify-between gap-4 border-t pt-3">
               <div className="grid gap-0.5">
@@ -848,7 +869,11 @@ function ProfileSheet({
                   )}
                 </p>
               </div>
-              <Switch checked={streaming} onCheckedChange={setStreaming} aria-label={t("Streaming output")} />
+              <Switch
+                checked={streaming}
+                onCheckedChange={(v) => setField({ streaming: v })}
+                aria-label={t("Streaming output")}
+              />
             </div>
           </div>
 
@@ -870,7 +895,7 @@ function ProfileSheet({
                 min={0}
                 className="w-28 shrink-0"
                 value={maxTokens}
-                onChange={(e) => setMaxTokens(e.target.value)}
+                onChange={(e) => setField({ maxTokens: e.target.value })}
                 placeholder="0"
               />
             </div>
@@ -881,7 +906,7 @@ function ProfileSheet({
               </div>
               <Select
                 value={format === "openai" ? maxTokensField : NONE}
-                onValueChange={setMaxTokensField}
+                onValueChange={(v) => setField({ maxTokensField: v })}
                 disabled={format !== "openai"}
               >
                 <SelectTrigger className="w-56 shrink-0">
@@ -908,7 +933,7 @@ function ProfileSheet({
                   )}
                 </p>
               </div>
-              <Select value={thinkingType} onValueChange={setThinkingType}>
+              <Select value={thinkingType} onValueChange={(v) => setField({ thinkingType: v })}>
                 <SelectTrigger className="w-32 shrink-0">
                   <SelectValue />
                 </SelectTrigger>
@@ -930,7 +955,7 @@ function ProfileSheet({
                   )}
                 </p>
               </div>
-              <Select value={effort} onValueChange={setEffort}>
+              <Select value={effort} onValueChange={(v) => setField({ effort: v })}>
                 <SelectTrigger className="w-32 shrink-0">
                   <SelectValue />
                 </SelectTrigger>
@@ -945,7 +970,7 @@ function ProfileSheet({
             </div>
           </div>
 
-          <ProfileRetryFields value={retry} onChange={setRetry} />
+          <ProfileRetryFields value={retry} onChange={(r) => setField({ retry: r })} />
         </div>
 
         <div className="flex gap-2 border-t px-4 py-3">
@@ -967,21 +992,18 @@ function ProfileSheet({
 // ─────────────────────────────────────────────────────────────────────────────
 
 export default function LLMPage() {
-  const [profiles, setProfiles] = React.useState<LLMProfile[]>([]);
-  const [pool, setPool] = React.useState<LLMPoolStatus | null>(null);
-  const [poolOpen, setPoolOpen] = React.useState(false);
-  // The drawer's open flag and its content are stored separately: editing stays put on close, otherwise during the closing animation the title would flash
-  // from "Edit X" to "New". editing = null means create.
-  const [editOpen, setEditOpen] = React.useState(false);
-  const [editing, setEditing] = React.useState<LLMProfile | null>(null);
-  const openEditor = React.useCallback((p: LLMProfile | null) => {
-    setEditing(p);
-    setEditOpen(true);
-  }, []);
+  const [state, dispatch] = React.useReducer(llmPageReducer, initialLLMPageState);
+  const { profiles, pool } = state.data;
+  const { poolOpen } = state;
+  // The drawer's open flag and its content are stored separately (see LLMProfileEditor). editing = null means create.
+  const { open: editOpen, profile: editing } = state.editor;
+  const openEditor = React.useCallback((p: LLMProfile | null) => dispatch({ type: "editorOpened", profile: p }), []);
+  const setEditOpen = React.useCallback((open: boolean) => dispatch({ type: "editorOpenChanged", open }), []);
+  const setPoolOpen = React.useCallback((open: boolean) => dispatch({ type: "poolOpenChanged", open }), []);
 
   const loadPool = React.useCallback(async () => {
     try {
-      setPool(await api.llmPool());
+      dispatch({ type: "poolLoaded", pool: await api.llmPool() });
     } catch {
       /* ignore */
     }
@@ -989,7 +1011,7 @@ export default function LLMPage() {
 
   const load = React.useCallback(async () => {
     try {
-      setProfiles(await api.llmProfiles());
+      dispatch({ type: "profilesLoaded", profiles: await api.llmProfiles() });
     } catch {
       /* ignore */
     }

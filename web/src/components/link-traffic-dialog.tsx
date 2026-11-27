@@ -4,6 +4,11 @@ import * as React from "react";
 
 import { toast } from "sonner";
 
+import {
+  initialLinkTrafficState,
+  linkTrafficReducer,
+  PAGE_SIZE,
+} from "@/components/_state/link-traffic-dialog.reducer";
 import { Alert, AlertDescription } from "@/components/ui/alert";
 import { Button } from "@/components/ui/button";
 import {
@@ -17,7 +22,6 @@ import {
 import { Field, FieldGroup, FieldLabel } from "@/components/ui/field";
 import { Input } from "@/components/ui/input";
 import { api } from "@/lib/api";
-import type { Finding, FindingsPage } from "@/lib/types";
 import { t } from "@/i18n";
 
 export function LinkTrafficDialog({
@@ -29,28 +33,24 @@ export function LinkTrafficDialog({
   onClose: () => void;
   onBound: () => void;
 }) {
-  const [query, setQuery] = React.useState("");
-  const [page, setPage] = React.useState(1);
-  const [data, setData] = React.useState<FindingsPage | null>(null);
-  const [selected, setSelected] = React.useState<Finding | null>(null);
-  const [error, setError] = React.useState("");
-  const [busy, setBusy] = React.useState(false);
-  const [loading, setLoading] = React.useState(true);
+  const [state, dispatch] = React.useReducer(linkTrafficReducer, initialLinkTrafficState);
+  const { query, selected, saving: busy, error } = state;
+  const { page } = state.pagination;
+  const { items, total, loading } = state.list;
   React.useEffect(() => {
     let active = true;
-    setLoading(true);
-    setError("");
+    dispatch({ type: "list/loadStarted" });
     const timer = setTimeout(() => {
       api
-        .findingsPage({ page, pageSize: 20, query })
+        .findingsPage({ page, pageSize: PAGE_SIZE, query })
         .then((d) => {
-          if (active) setData(d);
+          if (active) dispatch({ type: "list/loaded", items: d.items, total: d.total });
         })
         .catch((e: Error) => {
-          if (active) setError(e.message);
+          if (active) dispatch({ type: "loadFailed", error: e.message });
         })
         .finally(() => {
-          if (active) setLoading(false);
+          if (active) dispatch({ type: "list/loadFinished" });
         });
     }, 250);
     return () => {
@@ -60,8 +60,7 @@ export function LinkTrafficDialog({
   }, [query, page]);
   async function save() {
     if (!selected?.finding_id) return;
-    setBusy(true);
-    setError("");
+    dispatch({ type: "saveStarted" });
     try {
       await api.bindFindingTraffic(
         selected.finding_id,
@@ -73,9 +72,9 @@ export function LinkTrafficDialog({
       onBound();
       onClose();
     } catch (e) {
-      setError((e as Error).message);
+      dispatch({ type: "saveFailed", error: (e as Error).message });
     } finally {
-      setBusy(false);
+      dispatch({ type: "saveFinished" });
     }
   }
   return (
@@ -101,10 +100,7 @@ export function LinkTrafficDialog({
               id="link-finding-query"
               placeholder={t("Name / summary / vulnerability class")}
               value={query}
-              onChange={(e) => {
-                setQuery(e.target.value);
-                setPage(1);
-              }}
+              onChange={(e) => dispatch({ type: "queryChanged", query: e.target.value })}
             />
           </Field>
         </FieldGroup>
@@ -114,14 +110,14 @@ export function LinkTrafficDialog({
           </Alert>
         ) : null}
         <div className="flex max-h-[40vh] flex-col gap-2 overflow-auto" aria-busy={loading}>
-          {(data?.items ?? []).map((f) => (
+          {items.map((f) => (
             <Button
               key={f.finding_id ?? f.id}
               variant={selected?.finding_id === f.finding_id ? "secondary" : "outline"}
               className="h-auto justify-start p-3 text-left whitespace-normal"
               aria-pressed={selected?.finding_id === f.finding_id}
               disabled={busy || !f.finding_id || f.inherited}
-              onClick={() => setSelected(f)}
+              onClick={() => dispatch({ type: "findingSelected", finding: f })}
             >
               <span className="flex min-w-0 flex-col gap-1">
                 <span>
@@ -131,22 +127,27 @@ export function LinkTrafficDialog({
               </span>
             </Button>
           ))}
-          {!data?.items.length ? (
+          {!items.length ? (
             <p className="py-6 text-center text-sm text-muted-foreground">
               {loading ? t("Loading…") : t("No matching vulnerabilities; register one first")}
             </p>
           ) : null}
         </div>
         <div className="flex items-center justify-between gap-2">
-          <Button variant="outline" size="sm" disabled={loading || page <= 1} onClick={() => setPage((p) => p - 1)}>
-            {t("Previous")}
-          </Button>
-          <span className="text-xs">{t("Page {page} · {total} total", { page, total: data?.total ?? 0 })}</span>
           <Button
             variant="outline"
             size="sm"
-            disabled={loading || page * 20 >= (data?.total ?? 0)}
-            onClick={() => setPage((p) => p + 1)}
+            disabled={loading || page <= 1}
+            onClick={() => dispatch({ type: "pagination/pageChanged", page: page - 1 })}
+          >
+            {t("Previous")}
+          </Button>
+          <span className="text-xs">{t("Page {page} · {total} total", { page, total })}</span>
+          <Button
+            variant="outline"
+            size="sm"
+            disabled={loading || page * PAGE_SIZE >= total}
+            onClick={() => dispatch({ type: "pagination/pageChanged", page: page + 1 })}
           >
             {t("Next")}
           </Button>

@@ -13,29 +13,25 @@ import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@
 import { intlLocale, t } from "@/i18n";
 import { api } from "@/lib/api";
 import { statusMeta, toneClasses } from "@/lib/status";
-import type { NotificationChannel, NotificationDelivery } from "@/lib/types";
+import type { NotificationChannel } from "@/lib/types";
+
+import { deliveryListReducer, initialDeliveryListState } from "../_state/delivery-list.reducer";
 
 // DeliveryList is the delivery records table: filterable by channel and state, with manual retry for failed items.
 export function DeliveryList({ channels }: { channels: NotificationChannel[] }) {
-  const [rows, setRows] = React.useState<NotificationDelivery[]>([]);
-  const [total, setTotal] = React.useState(0);
-  const [page, setPage] = React.useState(1);
-  const [channelID, setChannelID] = React.useState<number | undefined>(undefined);
-  const [state, setState] = React.useState<string | undefined>(undefined);
-  const [loading, setLoading] = React.useState(false);
-  const pageSize = 50;
+  const [listState, dispatch] = React.useReducer(deliveryListReducer, initialDeliveryListState);
+  const { channelID, state } = listState.filters;
+  const { page, size: pageSize } = listState.pagination;
+  const { items: rows, total, loading } = listState.list;
 
   const load = React.useCallback(() => {
-    setLoading(true);
+    dispatch({ type: "list/loadStarted" });
     api
       .notifyDeliveries({ channelId: channelID, state, page, pageSize })
-      .then((r) => {
-        setRows(r.deliveries);
-        setTotal(r.total);
-      })
+      .then((r) => dispatch({ type: "list/loaded", items: r.deliveries, total: r.total }))
       .catch((e) => toast.error(t("Failed to load delivery records: {error}", { error: (e as Error).message })))
-      .finally(() => setLoading(false));
-  }, [channelID, state, page]);
+      .finally(() => dispatch({ type: "list/loadFinished" }));
+  }, [channelID, state, page, pageSize]);
   React.useEffect(() => {
     load();
   }, [load]);
@@ -58,8 +54,7 @@ export function DeliveryList({ channels }: { channels: NotificationChannel[] }) 
         <Select
           value={channelID ? String(channelID) : "all"}
           onValueChange={(v) => {
-            setPage(1);
-            setChannelID(v === "all" ? undefined : Number(v));
+            dispatch({ type: "filtersChanged", patch: { channelID: v === "all" ? undefined : Number(v) } });
           }}
         >
           <SelectTrigger size="sm" className="w-44">
@@ -77,8 +72,7 @@ export function DeliveryList({ channels }: { channels: NotificationChannel[] }) 
         <Select
           value={state ?? "all"}
           onValueChange={(v) => {
-            setPage(1);
-            setState(v === "all" ? undefined : v);
+            dispatch({ type: "filtersChanged", patch: { state: v === "all" ? undefined : v } });
           }}
         >
           <SelectTrigger size="sm" className="w-32">
@@ -163,13 +157,23 @@ export function DeliveryList({ channels }: { channels: NotificationChannel[] }) 
 
       {maxPage > 1 && (
         <div className="flex items-center justify-end gap-2">
-          <Button size="sm" variant="outline" disabled={page <= 1} onClick={() => setPage((p) => p - 1)}>
+          <Button
+            size="sm"
+            variant="outline"
+            disabled={page <= 1}
+            onClick={() => dispatch({ type: "pageStepped", delta: -1 })}
+          >
             {t("Previous")}
           </Button>
           <span className="text-muted-foreground text-sm">
             {page} / {maxPage}
           </span>
-          <Button size="sm" variant="outline" disabled={page >= maxPage} onClick={() => setPage((p) => p + 1)}>
+          <Button
+            size="sm"
+            variant="outline"
+            disabled={page >= maxPage}
+            onClick={() => dispatch({ type: "pageStepped", delta: 1 })}
+          >
             {t("Next")}
           </Button>
         </div>

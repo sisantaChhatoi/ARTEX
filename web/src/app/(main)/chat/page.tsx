@@ -53,7 +53,6 @@ import { ScrollArea } from "@/components/ui/scroll-area";
 import { Select, SelectContent, SelectGroup, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Spinner } from "@/components/ui/spinner";
 import { useSideQuestions } from "@/hooks/use-side-questions";
-import { mergeActivities } from "@/lib/activity-merge";
 import { api } from "@/lib/api";
 import { shouldSubmitOnKey, useChatSendMode } from "@/lib/chat-send-mode";
 import { formatBytes, formatTokens } from "@/lib/format";
@@ -63,11 +62,14 @@ import type { Activity, Agent, ChatAttachment, Conversation, LLMProfile } from "
 import { cn } from "@/lib/utils";
 import { intlLocale, t } from "@/i18n";
 
+import { chatPageReducer, conversationIsPinned, initChatPageState } from "./_state/chat-page.reducer";
+import { chatViewReducer, initChatViewState } from "./_state/chat-view.reducer";
+import { draftChatReducer, initialDraftChatState } from "./_state/draft-chat.reducer";
+
 // HISTORY_PAGE is how many steps one history page loads: the latest page on open,
 // then one more page each time the user scrolls to the top. Kept modest so a long
 // thread stays snappy (only ~a page of rows is in the DOM until you scroll up).
 const HISTORY_PAGE = 200;
-const CONVERSATION_LIST_PAGE = 100;
 
 // Which agent groups the user has collapsed in the left rail. Persisted so the
 // rail looks the same after a reload; unknown keys are harmless (a deleted agent
@@ -77,10 +79,6 @@ const COLLAPSED_AGENTS_KEY = "artex.chat.collapsed-agents";
 // sidebar links to a bare /chat, so without this, coming back from another page
 // always lands on the empty draft view. A ?c= in the URL takes precedence.
 const LAST_CONVERSATION_KEY = "artex.chat.last-conversation";
-
-function conversationIsPinned(conversation: Conversation): boolean {
-  return conversation.pinned ?? Boolean(conversation.pinned_at);
-}
 
 // AgentGroup is one collapsible section of the left rail: all unpinned
 // conversations of a single agent, newest activity first.
@@ -361,15 +359,14 @@ function DraftChat({
   profiles: LLMProfile[];
   onStarted: (c: Conversation, pending?: { input?: string; attachments?: ChatAttachment[] }) => void;
 }) {
-  const [agentKey, setAgentKey] = React.useState("");
-  const [llmProfileId, setLlmProfileId] = React.useState<number | null>(null);
-  const [input, setInput] = React.useState("");
-  const [sending, setSending] = React.useState(false);
-  const [uploading, setUploading] = React.useState(false);
+  const [state, dispatch] = React.useReducer(draftChatReducer, initialDraftChatState);
+  const { agentKey, llmProfileId, input } = state.form;
+  const sending = state.requests.send.pending;
+  const uploading = state.requests.upload.pending;
 
   // default the agent to Auto once agents load.
   React.useEffect(() => {
-    if (!agentKey && agents.some((a) => a.key === "auto")) setAgentKey("auto");
+    if (!agentKey && agents.some((a) => a.key === "auto")) dispatch({ type: "agentChanged", agentKey: "auto" });
   }, [agentKey, agents]);
 
   const agent = agents.find((a) => a.key === agentKey);
@@ -377,14 +374,14 @@ function DraftChat({
   async function send() {
     const msg = input.trim();
     if (!msg || !agentKey || sending) return;
-    setSending(true);
+    dispatch({ type: "request/started", key: "send" });
     try {
       const c = await api.createConversation(agentKey, "", llmProfileId);
       await api.sendConversationMessage(c.id, msg);
       onStarted(c);
     } catch (e) {
       toast.error(t("Send failed: {error}", { error: (e as Error).message }));
-      setSending(false);
+      dispatch({ type: "request/finished", key: "send" });
     }
   }
 
@@ -395,19 +392,19 @@ function DraftChat({
   // the ChatGPT-style lazy-create flow.
   async function pickFiles(files: File[]) {
     if (files.length === 0 || !agentKey || uploading || sending) return;
-    setUploading(true);
+    dispatch({ type: "request/started", key: "upload" });
     try {
       const c = await api.createConversation(agentKey, "", llmProfileId);
       const r = await api.chatUpload("session", `conv-${c.id}`, files);
       onStarted(c, { input, attachments: r.attachments });
     } catch (e) {
       toast.error(t("Upload failed: {error}", { error: (e as Error).message }));
-      setUploading(false);
+      dispatch({ type: "request/finished", key: "upload" });
     }
   }
 
   const agentPicker = (
-    <Select value={agentKey} onValueChange={setAgentKey}>
+    <Select value={agentKey} onValueChange={(key) => dispatch({ type: "agentChanged", agentKey: key })}>
       <SelectTrigger className="w-full sm:w-40">
         <SelectValue placeholder={t("Select an agent…")} />
       </SelectTrigger>
@@ -446,7 +443,7 @@ function DraftChat({
 
       <Composer
         value={input}
-        onChange={setInput}
+        onChange={(value) => dispatch({ type: "inputChanged", input: value })}
         onSend={send}
         disabled={sending || uploading || !agentKey}
         placeholder={t("Type a message, @ to reference records, Enter to send")}
@@ -457,7 +454,7 @@ function DraftChat({
       <LLMProfileRow
         profiles={profiles}
         selected={llmProfileId}
-        onChange={setLlmProfileId}
+        onChange={(id) => dispatch({ type: "llmProfileChanged", llmProfileId: id })}
         disabled={sending || uploading}
       />
     </>
@@ -485,20 +482,17 @@ function ChatView({
   onConvUpdated: () => void;
 }) {
   const approvalFocus = useApprovalFocus({ conversationId: conv.id });
-  const [messages, setMessages] = React.useState<Activity[]>([]);
-  const [running, setRunning] = React.useState(false);
-  const [input, setInput] = React.useState(initial?.input ?? "");
-  const [sending, setSending] = React.useState(false);
-  const [stopping, setStopping] = React.useState(false);
   // Upload method 1: already-uploaded attachments (stored under sessions/conv-<id>/uploads/) are sent with the next message.
-  const [attachments, setAttachments] = React.useState<ChatAttachment[]>(initial?.attachments ?? []);
-  const [uploading, setUploading] = React.useState(false);
+  const [state, dispatch] = React.useReducer(chatViewReducer, initial, initChatViewState);
+  const { messages, running, historyLoaded, hasMore } = state.transcript;
+  const { input, attachments } = state.composer;
+  const sending = state.requests.send.pending;
+  const stopping = state.requests.stop.pending;
+  const uploading = state.requests.upload.pending;
   const cursorRef = React.useRef(0); // newest loaded id — incremental-tail anchor
   const earliestRef = React.useRef(0); // earliest loaded id — reverse-pagination anchor
   const hasMoreRef = React.useRef(false); // older history remains above the loaded window
   const loadingMoreRef = React.useRef(false); // guard: one scroll-up load at a time
-  const [historyLoaded, setHistoryLoaded] = React.useState(false);
-  const [hasMore, setHasMore] = React.useState(false); // drives the "load earlier" hint
   const agent = agents.find((a) => a.key === conv.agent_key);
   const currentProfileId = conv.llm_profile_id ?? null;
   const side = useSideQuestions(`/api/conversations/${conv.id}`);
@@ -533,27 +527,21 @@ function ChatView({
     cursorRef.current = 0;
     earliestRef.current = 0;
     hasMoreRef.current = false;
-    setHasMore(false);
-    setMessages([]);
-    setHistoryLoaded(false);
-    setRunning(false);
+    dispatch({ type: "conversationReset" });
     let live = true;
     api
       .conversationHistory(conv.id, 0, HISTORY_PAGE)
       .then((r) => {
         if (!live) return;
-        setMessages((current) => mergeActivities(r.items, current));
+        dispatch({ type: "latestHistoryLoaded", items: r.items, hasMore: r.hasMore, running: r.running });
         cursorRef.current = Math.max(cursorRef.current, r.cursor);
         earliestRef.current = r.items.length ? r.items[0].seq : 0;
         hasMoreRef.current = r.hasMore;
-        setHasMore(r.hasMore);
-        setRunning((current) => current || r.running);
-        setHistoryLoaded(true);
       })
       .catch(() => {
         // A source link can retry history through its locator; ordinary chats
         // retain the existing usable empty state on a transient failure.
-        if (live) setHistoryLoaded(true);
+        if (live) dispatch({ type: "latestHistoryFailed" });
       });
     return () => {
       live = false;
@@ -563,7 +551,7 @@ function ChatView({
   // A trigger or another tab may start a turn while this conversation is open.
   // A false list snapshot must not stop the tail before its final messages load.
   React.useEffect(() => {
-    if (conv.running) setRunning(true);
+    if (conv.running) dispatch({ type: "transcriptChanged", patch: { running: true } });
   }, [conv.running]);
 
   // poll while a turn is running: pull new steps after the cursor.
@@ -576,12 +564,9 @@ function ChatView({
       try {
         const r = await api.conversationMessages(conv.id, cursorRef.current);
         if (!live) return;
-        if (r.items.length) {
-          setMessages((prev) => mergeActivities(prev, r.items));
-        }
+        dispatch({ type: "messagesPolled", items: r.items, running: r.running });
         cursorRef.current = Math.max(cursorRef.current, r.cursor);
         keepPolling = r.running;
-        setRunning(r.running);
         if (!r.running) onTitleMaybeChanged(); // first-turn auto-title landed
       } catch {
         /* transient — keep polling */
@@ -599,10 +584,9 @@ function ChatView({
 
   const loadFocusPage = React.useCallback((before: number) => api.conversationHistory(conv.id, before, HISTORY_PAGE), [conv.id]);
   const mergeFocusPage = React.useCallback((page: { items: Activity[]; hasMore: boolean }) => {
-    setMessages((prev) => mergeActivities(page.items, prev));
+    dispatch({ type: "olderHistoryMerged", items: page.items, hasMore: page.hasMore });
     earliestRef.current = page.items[0]?.seq ?? earliestRef.current;
     hasMoreRef.current = page.hasMore;
-    setHasMore(page.hasMore);
   }, []);
   const focusHistory = useApprovalHistory(approvalFocus.state?.source, historyLoaded, messages, loadFocusPage, mergeFocusPage);
 
@@ -624,12 +608,9 @@ function ChatView({
     const prevTop = vp.scrollTop;
     try {
       const r = await api.conversationHistory(conv.id, earliestRef.current, HISTORY_PAGE);
-      if (r.items.length) {
-        setMessages((prev) => mergeActivities(r.items, prev));
-        earliestRef.current = r.items[0].seq;
-      }
+      dispatch({ type: "olderHistoryMerged", items: r.items, hasMore: r.hasMore });
+      if (r.items.length) earliestRef.current = r.items[0].seq;
       hasMoreRef.current = r.hasMore;
-      setHasMore(r.hasMore);
       requestAnimationFrame(() => {
         const v = viewport();
         if (v) v.scrollTop = prevTop + (v.scrollHeight - prevH);
@@ -701,36 +682,34 @@ function ChatView({
   // uploads/) and queues the returned metadata to send with the next message.
   async function pickFiles(files: File[]) {
     if (files.length === 0) return;
-    setUploading(true);
+    dispatch({ type: "request/started", key: "upload" });
     try {
       const r = await api.chatUpload("session", `conv-${conv.id}`, files);
-      setAttachments((prev) => [...prev, ...r.attachments]);
+      dispatch({ type: "attachmentsUploaded", attachments: r.attachments });
     } catch (e) {
       toast.error(t("Upload failed: {error}", { error: (e as Error).message }));
     } finally {
-      setUploading(false);
+      dispatch({ type: "request/finished", key: "upload" });
     }
   }
 
   async function send() {
     const msg = input.trim();
     const atts = attachments;
-    if (side.handleCommand(msg, () => setInput(""))) return;
+    if (side.handleCommand(msg, () => dispatch({ type: "composerChanged", patch: { input: "" } }))) return;
     if ((!msg && atts.length === 0) || sending || running) return;
-    setSending(true);
-    setInput("");
-    setAttachments([]);
+    dispatch({ type: "messageSendStarted" });
     try {
       await api.sendConversationMessage(conv.id, msg, atts.length ? atts : undefined);
       // The live loop pulls the persisted human turn immediately. Sharing that
       // fetch avoids racing a separate post-send request against the poller.
-      setRunning(true);
+      dispatch({ type: "transcriptChanged", patch: { running: true } });
     } catch (e) {
       toast.error(t("Send failed: {error}", { error: (e as Error).message }));
-      setInput(msg); // restore so the user doesn't lose their text
-      setAttachments(atts); // and their attachments
+      // restore so the user doesn't lose their text and attachments
+      dispatch({ type: "messageSendFailed", input: msg, attachments: atts });
     } finally {
-      setSending(false);
+      dispatch({ type: "request/finished", key: "send" });
     }
   }
 
@@ -739,13 +718,13 @@ function ChatView({
   // affected — the agent's next queued fire still starts.
   async function stop() {
     if (stopping) return;
-    setStopping(true);
+    dispatch({ type: "request/started", key: "stop" });
     try {
       await api.stopConversation(conv.id);
     } catch (e) {
       toast.error(t("Stop failed: {error}", { error: (e as Error).message }));
     } finally {
-      setStopping(false);
+      dispatch({ type: "request/finished", key: "stop" });
     }
   }
 
@@ -806,7 +785,7 @@ function ChatView({
 
       <Composer
         value={input}
-        onChange={setInput}
+        onChange={(value) => dispatch({ type: "composerChanged", patch: { input: value } })}
         onSend={send}
         disabled={running || sending}
         allowBtw
@@ -820,7 +799,7 @@ function ChatView({
         stopDisabled={stopping}
         attachments={attachments}
         onPickFiles={pickFiles}
-        onRemoveAttachment={(path) => setAttachments((p) => p.filter((x) => x.path !== path))}
+        onRemoveAttachment={(path) => dispatch({ type: "attachmentRemoved", path })}
         uploading={uploading}
       />
       <LLMProfileRow
@@ -1043,49 +1022,38 @@ function AgentGroupHeader({
 }
 
 export default function ChatPage() {
-  const [agents, setAgents] = React.useState<Agent[]>([]);
-  const [profiles, setProfiles] = React.useState<LLMProfile[]>([]);
-  const [convs, setConvs] = React.useState<Conversation[]>([]);
-  const [agentFilter, setAgentFilter] = React.useState<string | null>(null);
-  const [selectedId, setSelectedId] = React.useState<number | null>(null);
-  const [sourceRequested, setSourceRequested] = React.useState(false);
-  const [convsLoaded, setConvsLoaded] = React.useState(false);
-  const selectConversation = React.useCallback((id: number | null) => {
-    if (id !== selectedId) {
-      const url = new URL(window.location.href);
-      url.searchParams.delete("approval");
-      setSourceRequested(false);
-      window.history.replaceState(null, "", url);
-    }
-    setSelectedId(id);
-  }, [selectedId]);
-
-  const [renamingId, setRenamingId] = React.useState<number | null>(null);
-  const [renameText, setRenameText] = React.useState("");
-  const [selectedConversationIds, setSelectedConversationIds] = React.useState<Set<number>>(() => new Set());
+  const [state, dispatch] = React.useReducer(chatPageReducer, undefined, initChatPageState);
+  const { agents, profiles } = state.catalog;
+  const { items: convs, loaded: convsLoaded } = state.list;
+  const { selectedId, sourceRequested } = state.nav;
+  const { agentFilter, visibleCount: visibleConversationCount, collapsedAgents } = state.sidebar;
+  const { id: renamingId, text: renameText } = state.rename;
   // selectionMode gates the multi-select UI: off by default (clean list, no
   // checkboxes); the header "Select" button turns it on, "Done" turns it off and
   // clears the selection.
-  const [selectionMode, setSelectionMode] = React.useState(false);
-  const [bulkDeleteOpen, setBulkDeleteOpen] = React.useState(false);
-  const [bulkDeleting, setBulkDeleting] = React.useState(false);
-  const [visibleConversationCount, setVisibleConversationCount] = React.useState(CONVERSATION_LIST_PAGE);
-  // Collapsed agent groups. Hydrated from localStorage after mount (not a lazy
-  // useState init) so the server and client render the same first pass.
-  const [collapsedAgents, setCollapsedAgents] = React.useState<Set<string>>(() => new Set());
-  // Pending text + uploaded attachments handed off from a draft that created a
-  // conversation via the paperclip, keyed by the new conversation id (consumed once
-  // by ChatView on mount; ids never repeat, so leftover entries are harmless).
-  const [pendingByConv, setPendingByConv] = React.useState<
-    Record<number, { input?: string; attachments?: ChatAttachment[] }>
-  >({});
+  const { selectionMode, selection: selectedConversationIds, bulkDeleteOpen, pendingByConv } = state;
+  const bulkDeleting = state.requests.bulkDelete.pending;
+  const selectConversation = React.useCallback(
+    (id: number | null) => {
+      if (id !== selectedId) {
+        const url = new URL(window.location.href);
+        url.searchParams.delete("approval");
+        window.history.replaceState(null, "", url);
+      }
+      dispatch({ type: "conversationSelected", id });
+    },
+    [selectedId],
+  );
 
   const conversationListSeq = React.useRef(0);
   const reloadConvs = React.useCallback(async () => {
     const seq = ++conversationListSeq.current;
     try {
       const items = await api.conversations();
-      if (seq === conversationListSeq.current) { setConvs(items); setConvsLoaded(true); }
+      if (seq === conversationListSeq.current) {
+        dispatch({ type: "list/loaded", items });
+        dispatch({ type: "list/loadFinished" });
+      }
     } catch {
       // Preserve the selected transcript and list on a transient poll failure.
     }
@@ -1093,13 +1061,13 @@ export default function ChatPage() {
   React.useEffect(() => {
     api
       .agents()
-      .then(setAgents)
+      .then((items) => dispatch({ type: "catalogChanged", patch: { agents: items } }))
       .catch(() => {
         /* Agent metadata is optional for rendering an existing conversation. */
       });
     api
       .llmProfiles()
-      .then(setProfiles)
+      .then((items) => dispatch({ type: "catalogChanged", patch: { profiles: items } }))
       .catch(() => {
         /* The conversation remains usable without profile labels. */
       });
@@ -1123,12 +1091,7 @@ export default function ChatPage() {
   }, [reloadConvs]);
 
   React.useEffect(() => {
-    setSelectedConversationIds((current) => {
-      if (current.size === 0) return current;
-      const live = new Set(convs.map((conversation) => conversation.id));
-      const next = new Set([...current].filter((id) => live.has(id)));
-      return next.size === current.size ? current : next;
-    });
+    dispatch({ type: "selection/pruned", keep: convs.map((conversation) => conversation.id) });
   }, [convs]);
 
   React.useEffect(() => {
@@ -1137,20 +1100,26 @@ export default function ChatPage() {
     try {
       const keys = JSON.parse(raw);
       if (Array.isArray(keys))
-        setCollapsedAgents(new Set(keys.filter((key): key is string => typeof key === "string")));
+        dispatch({
+          type: "collapsedAgentsRestored",
+          keys: keys.filter((key): key is string => typeof key === "string"),
+        });
     } catch {
       // Corrupted entry → start with everything expanded.
     }
   }, []);
 
+  // Persist only after the user toggles a group, so hydration never writes back.
+  const collapsedAgentsTouched = React.useRef(false);
   const toggleAgentCollapsed = React.useCallback((key: string) => {
-    setCollapsedAgents((current) => {
-      const next = new Set(current);
-      if (!next.delete(key)) next.add(key);
-      setLocalStorageValue(COLLAPSED_AGENTS_KEY, JSON.stringify([...next]));
-      return next;
-    });
+    collapsedAgentsTouched.current = true;
+    dispatch({ type: "agentGroupToggled", key });
   }, []);
+  React.useEffect(() => {
+    if (collapsedAgentsTouched.current) {
+      setLocalStorageValue(COLLAPSED_AGENTS_KEY, JSON.stringify([...collapsedAgents]));
+    }
+  }, [collapsedAgents]);
 
   // Restore the open conversation on mount, so a refresh or a return from another
   // page lands on the same thread instead of the empty draft view: the URL
@@ -1158,10 +1127,13 @@ export default function ChatPage() {
   // hydration (not a lazy useState init) to avoid a server/client mismatch.
   React.useEffect(() => {
     const params = new URLSearchParams(window.location.search);
-    setSourceRequested(params.has("approval"));
     const c = params.get("c") ?? getLocalStorageValue(LAST_CONVERSATION_KEY);
     const id = c ? Number(c) : NaN;
-    if (Number.isFinite(id)) setSelectedId(id);
+    dispatch({
+      type: "selectionRestored",
+      id: Number.isFinite(id) ? id : null,
+      sourceRequested: params.has("approval"),
+    });
   }, []);
   // Mirror the current selection into the URL (replaceState → no history spam). A
   // selectedId with no matching conversation (e.g. a stale ?c=, or a just-created
@@ -1227,11 +1199,7 @@ export default function ChatPage() {
     agentFilter === null ? t("{count} total", { count: convs.length }) : `${filteredConversations.length} / ${convs.length}`;
 
   function changeAgentFilter(key: string | null) {
-    setAgentFilter(key);
-    setVisibleConversationCount(CONVERSATION_LIST_PAGE);
-    setSelectedConversationIds(new Set());
-    setBulkDeleteOpen(false);
-    setRenamingId(null);
+    dispatch({ type: "agentFilterChanged", agentFilter: key });
   }
 
   const selectedConversationCount = selectedConversationIds.size;
@@ -1243,36 +1211,23 @@ export default function ChatPage() {
   else if (someConversationsSelected) conversationHeaderChecked = "indeterminate";
 
   const toggleConversationSelected = React.useCallback((id: number, checked: boolean) => {
-    setSelectedConversationIds((current) => {
-      const next = new Set(current);
-      if (checked) next.add(id);
-      else next.delete(id);
-      return next;
-    });
+    dispatch({ type: "conversationCheckedChanged", id, checked });
   }, []);
 
   function toggleAllConversations(checked: boolean) {
-    setSelectedConversationIds(
-      checked ? new Set(filteredConversations.map((conversation) => conversation.id)) : new Set(),
-    );
+    if (checked) dispatch({ type: "selection/set", ids: filteredConversations.map((conversation) => conversation.id) });
+    else dispatch({ type: "selection/cleared" });
   }
 
   function exitSelectionMode() {
-    setSelectionMode(false);
-    setSelectedConversationIds(new Set());
+    dispatch({ type: "selectionModeExited" });
   }
 
   const del = React.useCallback(
     async (id: number) => {
       try {
         await api.deleteConversation(id);
-        setSelectedId((current) => (current === id ? null : current));
-        setSelectedConversationIds((current) => {
-          if (!current.has(id)) return current;
-          const next = new Set(current);
-          next.delete(id);
-          return next;
-        });
+        dispatch({ type: "conversationDeleted", id });
         void reloadConvs();
       } catch (e) {
         toast.error(t("Delete failed: {error}", { error: (e as Error).message }));
@@ -1284,7 +1239,7 @@ export default function ChatPage() {
   async function deleteSelectedConversations() {
     const ids = [...selectedConversationIds];
     if (ids.length === 0 || bulkDeleting) return;
-    setBulkDeleting(true);
+    dispatch({ type: "request/started", key: "bulkDelete" });
     const deleted = new Set<number>();
     const failed: { id: number; error: string }[] = [];
     try {
@@ -1296,11 +1251,6 @@ export default function ChatPage() {
         }
       }
       if (deleted.has(selectedId ?? -1)) selectConversation(null);
-      setSelectedConversationIds((current) => {
-        const next = new Set(current);
-        for (const id of deleted) next.delete(id);
-        return next;
-      });
       if (deleted.size > 0) toast.success(t("Deleted {count} conversations", { count: deleted.size }));
       if (failed.length > 0) {
         const details = failed
@@ -1314,16 +1264,15 @@ export default function ChatPage() {
           }),
         );
       }
-      setBulkDeleteOpen(false);
       // Fully successful → return to the clean list; keep selection mode on if
       // some failed so the user can retry the remaining ones.
-      if (failed.length === 0) setSelectionMode(false);
+      dispatch({ type: "bulkDeleteSettled", deleted: [...deleted], allSucceeded: failed.length === 0 });
       void reloadConvs();
     } catch (error) {
       toast.error(t("Bulk delete failed: {error}", { error: (error as Error).message }));
       void reloadConvs();
     } finally {
-      setBulkDeleting(false);
+      dispatch({ type: "request/finished", key: "bulkDelete" });
     }
   }
 
@@ -1342,13 +1291,13 @@ export default function ChatPage() {
   );
 
   const startRename = React.useCallback((c: Conversation) => {
-    setRenamingId(c.id);
-    setRenameText(c.title || "");
+    dispatch({ type: "renameChanged", patch: { id: c.id, text: c.title || "" } });
   }, []);
+  const setRenameText = React.useCallback((text: string) => dispatch({ type: "renameChanged", patch: { text } }), []);
   const commitRename = React.useCallback(
     async (id: number, value: string) => {
       const title = value.trim();
-      setRenamingId(null);
+      dispatch({ type: "renameChanged", patch: { id: null } });
       if (!title) return;
       try {
         await api.renameConversation(id, title);
@@ -1359,7 +1308,7 @@ export default function ChatPage() {
     },
     [reloadConvs],
   );
-  const cancelRename = React.useCallback(() => setRenamingId(null), []);
+  const cancelRename = React.useCallback(() => dispatch({ type: "renameChanged", patch: { id: null } }), []);
 
   return (
     <div
@@ -1412,7 +1361,7 @@ export default function ChatPage() {
                       size="sm"
                       variant="destructive"
                       disabled={bulkDeleting}
-                      onClick={() => setBulkDeleteOpen(true)}
+                      onClick={() => dispatch({ type: "bulkDeleteOpenChanged", open: true })}
                     >
                       <Trash2Icon data-icon="inline-start" />
                       {t("Delete")}
@@ -1431,7 +1380,7 @@ export default function ChatPage() {
                     size="sm"
                     variant="ghost"
                     className="text-muted-foreground"
-                    onClick={() => setSelectionMode(true)}
+                    onClick={() => dispatch({ type: "selectionModeEntered" })}
                     disabled={filteredConversations.length === 0}
                   >
                     <ListChecksIcon data-icon="inline-start" />
@@ -1512,7 +1461,7 @@ export default function ChatPage() {
                   variant="ghost"
                   size="sm"
                   className="mt-1 w-full"
-                  onClick={() => setVisibleConversationCount((count) => count + CONVERSATION_LIST_PAGE)}
+                  onClick={() => dispatch({ type: "moreConversationsShown" })}
                 >
                   {t("Load more")}
                 </Button>
@@ -1542,25 +1491,18 @@ export default function ChatPage() {
               agents={chatAgents}
               profiles={profiles}
               onStarted={(c, pending) => {
-                if (agentFilter !== null && agentFilter !== c.agent_key) changeAgentFilter(null);
                 // Insert the new conversation immediately so `selected` resolves to
                 // it on this render (switching to ChatView right away, before the
                 // async reloadConvs lands); reloadConvs then reconciles titles etc.
-                if (pending) setPendingByConv((p) => ({ ...p, [c.id]: pending }));
-                setConvs((prev) => {
-                  if (prev.some((item) => item.id === c.id)) return prev;
-                  const firstUnpinned = prev.findIndex((item) => !conversationIsPinned(item));
-                  const insertAt = firstUnpinned < 0 ? prev.length : firstUnpinned;
-                  return [...prev.slice(0, insertAt), c, ...prev.slice(insertAt)];
-                });
-                setSelectedId(c.id);
+                // A filter hiding its agent is cleared first.
+                dispatch({ type: "conversationStarted", conversation: c, pending });
                 void reloadConvs();
               }}
             />
           )}
         </div>
       </div>
-      <AlertDialog open={bulkDeleteOpen} onOpenChange={setBulkDeleteOpen}>
+      <AlertDialog open={bulkDeleteOpen} onOpenChange={(open) => dispatch({ type: "bulkDeleteOpenChanged", open })}>
         <AlertDialogContent>
           <AlertDialogHeader>
             <AlertDialogTitle>

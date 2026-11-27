@@ -9,6 +9,8 @@ import type { LogLine } from "@/lib/types";
 import { cn } from "@/lib/utils";
 import { t } from "@/i18n";
 
+import { initialLogsPageState, logsPageReducer } from "./_state/logs-page.reducer";
+
 // Mock demo: no backend SSE, so stuff in a few sample log lines.
 const MOCK_LOGS: LogLine[] = [
   { seq: 1, ts: "2026-11-14T03:55:00Z", level: "info", tag: "engine", text: "ARTEX v0.6.0 backend listening on :8787 (workers=3)" },
@@ -38,12 +40,10 @@ function fmtTime(ts: string) {
 }
 
 export default function LogsPage() {
-  const [lines, setLines] = React.useState<LogLine[]>([]);
-  const [q, setQ] = React.useState("");
-  const [level, setLevel] = React.useState<"all" | LogLine["level"]>("all");
-  const [paused, setPaused] = React.useState(false);
-  const [loadingHistory, setLoadingHistory] = React.useState(false);
-  const [hasMore, setHasMore] = React.useState(false);
+  const [state, dispatch] = React.useReducer(logsPageReducer, initialLogsPageState);
+  const { lines, paused, hasMore } = state;
+  const { q, level } = state.filters;
+  const loadingHistory = state.requests.history.pending;
   const bottom = React.useRef<HTMLDivElement>(null);
   const stick = React.useRef(true);
   const pausedRef = React.useRef(false);
@@ -62,7 +62,7 @@ export default function LogsPage() {
   // DB-restored history from the last 100 rows written before restart).
   React.useEffect(() => {
     if (MOCK) {
-      setLines(MOCK_LOGS);
+      dispatch({ type: "linesReplaced", lines: MOCK_LOGS });
       return;
     }
     const es = new EventSource(sseUrl("/api/logs/stream?since=0"));
@@ -70,7 +70,7 @@ export default function LogsPage() {
       if (pausedRef.current) return;
       try {
         const l = JSON.parse(e.data) as LogLine;
-        setLines((prev) => (prev.some((x) => x.seq === l.seq) ? prev : [...prev, l].slice(-3000)));
+        dispatch({ type: "lineReceived", line: l });
       } catch {
         /* ignore malformed frame */
       }
@@ -80,40 +80,21 @@ export default function LogsPage() {
 
   // Mark "has more" once we have any db_id in view.
   React.useEffect(() => {
-    if (minDbId > 1) setHasMore(true);
+    if (minDbId > 1) dispatch({ type: "hasMoreChanged", hasMore: true });
   }, [minDbId]);
 
   async function loadOlderHistory() {
     if (loadingHistory) return;
-    setLoadingHistory(true);
+    dispatch({ type: "request/started", key: "history" });
     try {
       const params = minDbId > 0 ? `?before=${minDbId}&limit=200` : `?limit=200`;
       const res = await fetch(`/api/logs/history${params}`);
       if (!res.ok) return;
       const data = await res.json() as { items: LogLine[]; has_more: boolean };
-      if (data.items?.length) {
-        // Assign synthetic seq numbers below current minimum to keep dedup working.
-        setLines((prev) => {
-          const minSeq = prev.reduce((m, l) => Math.min(m, l.seq ?? 0), 0);
-          const older = data.items.map((l, i) => ({
-            ...l,
-            seq: minSeq - data.items.length + i,
-          }));
-          // Prepend, dedup by db_id, cap at 5000.
-          const merged = [...older, ...prev];
-          const seen = new Set<number>();
-          const deduped = merged.filter((l) => {
-            if (!l.db_id) return true;
-            if (seen.has(l.db_id)) return false;
-            seen.add(l.db_id);
-            return true;
-          });
-          return deduped.slice(-5000);
-        });
-      }
-      setHasMore(data.has_more ?? false);
+      // The reducer prepends the older lines (synthetic seq numbers below the current minimum, dedup by db_id, capped).
+      dispatch({ type: "olderLoaded", items: data.items ?? [], hasMore: data.has_more ?? false });
     } finally {
-      setLoadingHistory(false);
+      dispatch({ type: "request/finished", key: "history" });
     }
   }
 
@@ -151,7 +132,7 @@ export default function LogsPage() {
           <Input
             placeholder={t("Filter (text / tag)…")}
             value={q}
-            onChange={(e) => setQ(e.target.value)}
+            onChange={(e) => dispatch({ type: "queryChanged", q: e.target.value })}
             className="h-8 max-w-xs"
           />
           <div className="flex gap-1">
@@ -161,7 +142,7 @@ export default function LogsPage() {
                 size="sm"
                 variant={level === lv ? "default" : "outline"}
                 className="h-8"
-                onClick={() => setLevel(lv)}
+                onClick={() => dispatch({ type: "levelChanged", level: lv })}
               >
                 {lv === "all" ? t("All") : t(lv)}
               </Button>
@@ -171,11 +152,11 @@ export default function LogsPage() {
             size="sm"
             variant={paused ? "default" : "outline"}
             className="h-8"
-            onClick={() => setPaused((p) => !p)}
+            onClick={() => dispatch({ type: "pauseToggled" })}
           >
             {paused ? t("Paused") : t("Pause")}
           </Button>
-          <Button size="sm" variant="outline" className="h-8" onClick={() => setLines([])}>
+          <Button size="sm" variant="outline" className="h-8" onClick={() => dispatch({ type: "cleared" })}>
             {t("Clear")}
           </Button>
           <span className="ml-auto text-xs text-muted-foreground">

@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useReducer, useRef } from "react";
 
 import { useRouter } from "next/navigation";
 
@@ -15,30 +15,30 @@ import { t } from "@/i18n";
 import { api } from "@/lib/api";
 import { auth } from "@/lib/auth";
 
+import { initialLoginPageState, loginPageReducer } from "./_state/login-page.reducer";
+
 export default function LoginPage() {
   const router = useRouter();
-  const [password, setPassword] = useState("");
-  const [error, setError] = useState("");
-  const [loading, setLoading] = useState(false);
-  const [checking, setChecking] = useState(true);
-  const [agreed, setAgreed] = useState(false);
-  const [termsOpen, setTermsOpen] = useState(false);
-  const [readToEnd, setReadToEnd] = useState(false);
+  const [state, dispatch] = useReducer(loginPageReducer, initialLoginPageState);
+  const { password, agreed } = state.form;
+  const { open: termsOpen, readToEnd } = state.terms;
+  const { checking, submitting: loading, error } = state.status;
   const termsBodyRef = useRef<HTMLDivElement>(null);
 
   // Scroll to the bottom of the terms (including when everything fits without scrolling) to unlock "Agree".
   function handleTermsScroll() {
     const el = termsBodyRef.current;
     if (!el) return;
-    if (el.scrollTop + el.clientHeight >= el.scrollHeight - 8) setReadToEnd(true);
+    if (el.scrollTop + el.clientHeight >= el.scrollHeight - 8)
+      dispatch({ type: "termsChanged", patch: { readToEnd: true } });
   }
 
   useEffect(() => {
     if (!termsOpen) return;
     // Reset on open, and cover the case where the content is shorter than one screen and never fires a scroll.
-    setReadToEnd(false);
+    dispatch({ type: "termsChanged", patch: { readToEnd: false } });
     const el = termsBodyRef.current;
-    if (el && el.scrollHeight <= el.clientHeight + 8) setReadToEnd(true);
+    if (el && el.scrollHeight <= el.clientHeight + 8) dispatch({ type: "termsChanged", patch: { readToEnd: true } });
   }, [termsOpen]);
 
   useEffect(() => {
@@ -56,26 +56,25 @@ export default function LoginPage() {
       .then(({ initialized }) => {
         if (!initialized) router.replace("/setup");
       })
-      .catch(() => setError(t("Unable to connect to the backend service")))
-      .finally(() => setChecking(false));
+      .catch(() => dispatch({ type: "statusCheckFailed", error: t("Unable to connect to the backend service") }))
+      .finally(() => dispatch({ type: "statusChecked" }));
   }, [router]);
 
   async function handleSubmit(e: React.FormEvent) {
     e.preventDefault();
     if (!agreed) {
-      setError(t("Please read and agree to the Terms of Use first"));
+      dispatch({ type: "validationFailed", error: t("Please read and agree to the Terms of Use first") });
       return;
     }
-    setLoading(true);
-    setError("");
+    dispatch({ type: "submitStarted" });
     try {
       const { token } = await api.login("ARTEX", password);
       auth.setToken(token);
       window.location.replace("/function/tasks");
     } catch {
-      setError(t("Incorrect username or password"));
+      dispatch({ type: "submitFailed", error: t("Incorrect username or password") });
     } finally {
-      setLoading(false);
+      dispatch({ type: "submitFinished" });
     }
   }
 
@@ -127,7 +126,7 @@ export default function LoginPage() {
                 id="password"
                 type="password"
                 value={password}
-                onChange={(e) => setPassword(e.target.value)}
+                onChange={(e) => dispatch({ type: "formChanged", patch: { password: e.target.value } })}
                 placeholder={t("Enter your password")}
                 autoFocus
                 autoComplete="current-password"
@@ -137,14 +136,14 @@ export default function LoginPage() {
               <Checkbox
                 id="agree-terms"
                 checked={agreed}
-                onCheckedChange={(v) => setAgreed(v === true)}
+                onCheckedChange={(v) => dispatch({ type: "formChanged", patch: { agreed: v === true } })}
                 className="mt-0.5"
               />
               <Label htmlFor="agree-terms" className="text-sm font-normal leading-relaxed text-muted-foreground">
                 {agreeBefore}
                 <button
                   type="button"
-                  onClick={() => setTermsOpen(true)}
+                  onClick={() => dispatch({ type: "termsChanged", patch: { open: true } })}
                   className="mx-0.5 font-medium text-primary underline-offset-4 hover:underline"
                 >
                   {t("Terms of Use")}
@@ -160,7 +159,7 @@ export default function LoginPage() {
         </div>
       </div>
 
-      <Dialog open={termsOpen} onOpenChange={setTermsOpen}>
+      <Dialog open={termsOpen} onOpenChange={(open) => dispatch({ type: "termsChanged", patch: { open } })}>
         <DialogContent className="gap-0 p-0 sm:max-w-2xl">
           <DialogHeader className="flex-row items-center gap-3 border-b px-6 py-4">
             <div className="flex size-10 shrink-0 items-center justify-center rounded-lg bg-primary/10 text-primary">
@@ -333,14 +332,7 @@ export default function LoginPage() {
               {readToEnd ? t("You have read all the terms") : t("Scroll the terms to the bottom to confirm")}
             </p>
             <DialogClose asChild>
-              <Button
-                type="button"
-                disabled={!readToEnd}
-                onClick={() => {
-                  setAgreed(true);
-                  setError("");
-                }}
-              >
+              <Button type="button" disabled={!readToEnd} onClick={() => dispatch({ type: "termsAgreed" })}>
                 {t("I have read and agree to all the terms")}
               </Button>
             </DialogClose>

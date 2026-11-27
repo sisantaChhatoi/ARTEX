@@ -20,6 +20,12 @@ import { t } from "@/i18n";
 import { api } from "@/lib/api";
 import type { AssetInterceptKind, AssetInterceptRule } from "@/lib/types";
 
+import {
+  assetInterceptPageReducer,
+  initialAssetInterceptPageState,
+  type RuleForm,
+} from "./_state/asset-intercept-page.reducer";
+
 // ---- kind metadata ----
 
 const KIND_OPTIONS: { value: AssetInterceptKind; label: string; group: string; placeholder: string }[] = [
@@ -67,16 +73,7 @@ function Field({ label, hint, children }: { label: string; hint?: string; childr
   );
 }
 
-// ---- form state ----
-
-type RuleForm = {
-  enabled: boolean;
-  kind: AssetInterceptKind;
-  pattern: string;
-  note: string;
-};
-
-const defaultForm = (): RuleForm => ({ enabled: true, kind: "fuzzy_domain", pattern: "", note: "" });
+// ---- form validation ----
 
 // Light frontend validation (matching the backend: only exact_ip / cidr get format checks, the rest is left to the backend).
 function frontValidate(form: RuleForm): string | null {
@@ -91,20 +88,19 @@ function frontValidate(form: RuleForm): string | null {
 // ---- page ----
 
 export default function AssetInterceptPage() {
-  const [rules, setRules] = React.useState<AssetInterceptRule[]>([]);
-  const [loading, setLoading] = React.useState(true);
-  const [open, setOpen] = React.useState(false);
-  const [editing, setEditing] = React.useState<AssetInterceptRule | null>(null);
-  const [form, setForm] = React.useState<RuleForm>(defaultForm());
-  const [saving, setSaving] = React.useState(false);
+  const [state, dispatch] = React.useReducer(assetInterceptPageReducer, initialAssetInterceptPageState);
+  const { items: rules } = state.list;
+  const loading = !state.list.loaded;
+  const { open, editing, form } = state.editor;
+  const saving = state.requests.save.pending;
 
   const load = React.useCallback(async () => {
     try {
-      setRules(await api.assetInterceptRules());
+      dispatch({ type: "list/loaded", items: await api.assetInterceptRules() });
     } catch {
       toast.error(t("Failed to load asset interception rules"));
     } finally {
-      setLoading(false);
+      dispatch({ type: "list/loadFinished" });
     }
   }, []);
 
@@ -113,19 +109,15 @@ export default function AssetInterceptPage() {
   }, [load]);
 
   function set(patch: Partial<RuleForm>) {
-    setForm((f) => ({ ...f, ...patch }));
+    dispatch({ type: "formFieldChanged", patch });
   }
 
   function openNew() {
-    setEditing(null);
-    setForm(defaultForm());
-    setOpen(true);
+    dispatch({ type: "newRuleOpened" });
   }
 
   function openEdit(rule: AssetInterceptRule) {
-    setEditing(rule);
-    setForm({ enabled: rule.enabled, kind: rule.kind, pattern: rule.pattern, note: rule.note });
-    setOpen(true);
+    dispatch({ type: "editRuleOpened", rule });
   }
 
   async function handleSave() {
@@ -135,7 +127,7 @@ export default function AssetInterceptPage() {
       return;
     }
     const payload = { ...form, pattern: form.pattern.trim() };
-    setSaving(true);
+    dispatch({ type: "request/started", key: "save" });
     try {
       if (editing) {
         await api.updateAssetInterceptRule(editing.id, payload);
@@ -144,12 +136,12 @@ export default function AssetInterceptPage() {
         await api.createAssetInterceptRule(payload);
         toast.success(t("Rule created"));
       }
-      setOpen(false);
+      dispatch({ type: "editorOpenChanged", open: false });
       load();
     } catch (e) {
       toast.error((e as Error).message);
     } finally {
-      setSaving(false);
+      dispatch({ type: "request/finished", key: "save" });
     }
   }
 
@@ -270,7 +262,7 @@ export default function AssetInterceptPage() {
       </Card>
 
       {/* editor sheet */}
-      <Sheet open={open} onOpenChange={setOpen}>
+      <Sheet open={open} onOpenChange={(next) => dispatch({ type: "editorOpenChanged", open: next })}>
         <SheetContent side="right" className="flex flex-col gap-0 p-0 sm:max-w-md">
           <SheetHeader className="border-b px-6 py-4">
             <SheetTitle>{editing ? t("Edit asset interception rule") : t("Create asset interception rule")}</SheetTitle>
@@ -338,7 +330,7 @@ export default function AssetInterceptPage() {
           </div>
 
           <SheetFooter className="border-t px-6 py-4 flex-row justify-end gap-2">
-            <Button variant="outline" onClick={() => setOpen(false)}>
+            <Button variant="outline" onClick={() => dispatch({ type: "editorOpenChanged", open: false })}>
               {t("Cancel")}
             </Button>
             <Button onClick={handleSave} disabled={saving}>

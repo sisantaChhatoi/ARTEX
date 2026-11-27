@@ -45,7 +45,16 @@ import { formatShortDateTime } from "@/lib/format";
 import { cn } from "@/lib/utils";
 import { api } from "@/lib/api";
 import { t } from "@/i18n";
-import type { Agent, SkillItem, MCPServer, SkillCall, MissingSkill } from "@/lib/types";
+import type { MissingSkill, SkillItem } from "@/lib/types";
+
+import {
+  type Creating,
+  initialSkillsPageState,
+  type NewSkillForm,
+  type PendingDelete,
+  type Selected,
+  skillsPageReducer,
+} from "./_state/skills-page.reducer";
 
 // ── Tree node ──────────────────────────────────────────────────────────────
 interface TreeNode {
@@ -114,23 +123,6 @@ function sortNodes(nodes: TreeNode[]): void {
     if (n.children.length > 0) sortNodes(n.children);
   }
 }
-
-// ── State types ───────────────────────────────────────────────────────────
-type Selected =
-  | { skill: string; path: null }
-  | { skill: string; path: string };
-
-type Creating = {
-  skill: string;
-  inDir: string;
-  kind: "file" | "dir";
-} | null;
-
-type PendingDelete =
-  | { kind: "skill"; skill: string }
-  | { kind: "file"; skill: string; path: string }
-  | { kind: "dir"; skill: string; path: string }
-  | null;
 
 // ── Overview (empty-state) ──────────────────────────────────────────────────
 // Shown when nothing is selected: a library-wide snapshot from data already loaded
@@ -296,62 +288,66 @@ function SkillsOverview({
 
 // ── Page ──────────────────────────────────────────────────────────────────
 export default function SkillsPage() {
-  const [skills, setSkills] = React.useState<SkillItem[]>([]);
-  const [agents, setAgents] = React.useState<Agent[]>([]);
-  const [selected, setSelected] = React.useState<Selected | null>(null);
-  const [visibility, setVisibility] = React.useState<Record<string, string[]>>({});
-  const [expanded, setExpanded] = React.useState<Set<string>>(new Set());
+  const [state, dispatch] = React.useReducer(skillsPageReducer, initialSkillsPageState);
+  const { library, expanded, selected, editor, inlineCreate, newSkill, detailMcps, usage, pendingDelete, requests } =
+    state;
+  const { skills, agents, mcpOptions, missing, visibility } = library;
 
   // file editor
-  const [fileContent, setFileContent] = React.useState("");
-  const [fileLoading, setFileLoading] = React.useState(false);
-  const [dirty, setDirty] = React.useState(false);
-  const [saving, setSaving] = React.useState(false);
+  const { content: fileContent, loading: fileLoading, dirty } = editor;
+  const saving = requests.saveFile.pending;
 
   // inline create — using a ref to avoid stale closure in onBlur
-  const [creating, setCreating] = React.useState<Creating>(null);
-  const [newEntryName, setNewEntryName] = React.useState("");
+  const { creating, name: newEntryName } = inlineCreate;
   const inlineRef = React.useRef<HTMLInputElement>(null);
   // cancelRef prevents onBlur from committing when Escape was pressed
   const cancelRef = React.useRef(false);
 
   // new skill dialog
-  const [newOpen, setNewOpen] = React.useState(false);
-  const [newName, setNewName] = React.useState("");
-  const [newDesc, setNewDesc] = React.useState("");
-  const [newLicense, setNewLicense] = React.useState("");
-  const [newCompat, setNewCompat] = React.useState("");
-  const [newInst, setNewInst] = React.useState("");
-  const [newMcps, setNewMcps] = React.useState<string[]>([]);
-  const [newVisibility, setNewVisibility] = React.useState<string[]>([]);
-  const [mcpOptions, setMcpOptions] = React.useState<MCPServer[]>([]);
-  const [creatingSkill, setCreatingSkill] = React.useState(false);
-  const [uploading, setUploading] = React.useState(false);
+  const { open: newOpen, form: newSkillForm } = newSkill;
+  const {
+    name: newName,
+    desc: newDesc,
+    license: newLicense,
+    compat: newCompat,
+    inst: newInst,
+    mcps: newMcps,
+    visibility: newVisibility,
+  } = newSkillForm;
+  const creatingSkill = requests.createSkill.pending;
+  const uploading = requests.upload.pending;
   const uploadRef = React.useRef<HTMLInputElement>(null);
 
-  // skill detail — MCP edit state (optimistic, rolls back on error)
-  const [detailMcps, setDetailMcps] = React.useState<string[]>([]);
-
   // delete confirmation
-  const [pendingDelete, setPendingDelete] = React.useState<PendingDelete>(null);
-  const [deleting, setDeleting] = React.useState(false);
+  const deleting = requests.delete.pending;
 
   // Call stats: counts/last-used come back with api.skills(); selecting a skill fetches its
   // recent call details. missing = skills invoked by name that do not exist (wanted but absent).
-  const [usageCalls, setUsageCalls] = React.useState<SkillCall[]>([]);
-  const [usageLoading, setUsageLoading] = React.useState(false);
-  const [missing, setMissing] = React.useState<MissingSkill[]>([]);
+  const { calls: usageCalls, loading: usageLoading } = usage;
+
+  const setSelected = (next: Selected | null) => dispatch({ type: "selected", selected: next });
+  const setPendingDelete = (next: PendingDelete) => dispatch({ type: "pendingDeleteChanged", pendingDelete: next });
+  const setNewField = (patch: Partial<NewSkillForm>) => dispatch({ type: "newSkillFieldChanged", patch });
 
   // ── Data ──────────────────────────────────────────────────────────────────
   const load = React.useCallback(() => {
-    api.agents().then(setAgents).catch(() => {});
-    api.mcpServers().then(setMcpOptions).catch(() => {});
-    api.missingSkills().then(setMissing).catch(() => {});
+    api
+      .agents()
+      .then((items) => dispatch({ type: "libraryChanged", patch: { agents: items } }))
+      .catch(() => {});
+    api
+      .mcpServers()
+      .then((items) => dispatch({ type: "libraryChanged", patch: { mcpOptions: items } }))
+      .catch(() => {});
+    api
+      .missingSkills()
+      .then((items) => dispatch({ type: "libraryChanged", patch: { missing: items } }))
+      .catch(() => {});
     api.skills().then((ss) => {
-      setSkills(ss);
+        dispatch({ type: "libraryChanged", patch: { skills: ss } });
       ss.forEach((s) =>
         api.skillVisibility(s.name)
-          .then((ids) => setVisibility((v) => ({ ...v, [s.name]: ids })))
+            .then((ids) => dispatch({ type: "visibilityLoaded", skill: s.name, ids }))
           .catch(() => {}),
       );
     }).catch(() => {});
@@ -361,7 +357,7 @@ export default function SkillsPage() {
 
   // ── Upload a .zip skill ───────────────────────────────────────────────────
   async function uploadZip(file: File, overwrite = false) {
-    setUploading(true);
+    dispatch({ type: "request/started", key: "upload" });
     try {
       const r = await api.uploadSkill(file, overwrite);
       toast.success(t("Skill installed: {name} ({count} files)", { name: r.name, count: r.files }));
@@ -378,7 +374,7 @@ export default function SkillsPage() {
         toast.error(t("Upload failed: {error}", { error: msg }));
       }
     } finally {
-      setUploading(false);
+      dispatch({ type: "request/finished", key: "upload" });
     }
   }
   function onUploadPick(e: React.ChangeEvent<HTMLInputElement>) {
@@ -398,58 +394,48 @@ export default function SkillsPage() {
   React.useEffect(() => {
     if (!selected || selected.path !== null) return;
     const sk = skills.find((s) => s.name === selected.skill);
-    setDetailMcps(sk?.mcps ?? []);
+    dispatch({ type: "detailMcpsSet", mcps: sk?.mcps ?? [] });
   }, [selected, skills]);
 
   // Recent calls for the selected skill (detail panel only).
   React.useEffect(() => {
-    if (!selected || selected.path !== null) { setUsageCalls([]); return; }
+    if (!selected || selected.path !== null) {
+      dispatch({ type: "usageChanged", patch: { calls: [] } });
+      return;
+    }
     const name = selected.skill;
-    setUsageLoading(true);
+    dispatch({ type: "usageChanged", patch: { loading: true } });
     api.skillUsage(name, 20)
-      .then((calls) => setUsageCalls(calls))
-      .catch(() => setUsageCalls([]))
-      .finally(() => setUsageLoading(false));
+      .then((calls) => dispatch({ type: "usageChanged", patch: { calls } }))
+      .catch(() => dispatch({ type: "usageChanged", patch: { calls: [] } }))
+      .finally(() => dispatch({ type: "usageChanged", patch: { loading: false } }));
   }, [selected]);
 
   React.useEffect(() => {
-    if (!selected || selected.path === null) { setFileContent(""); setDirty(false); return; }
-    setFileLoading(true);
+    if (!selected || selected.path === null) {
+      dispatch({ type: "fileCleared" });
+      return;
+    }
+    dispatch({ type: "editorChanged", patch: { loading: true } });
     api.readSkillFile(selected.skill, selected.path)
-      .then((c) => { setFileContent(c); setDirty(false); })
+      .then((c) => dispatch({ type: "fileLoaded", content: c }))
       .catch(() => toast.error(t("Failed to read the file")))
-      .finally(() => setFileLoading(false));
+      .finally(() => dispatch({ type: "editorChanged", patch: { loading: false } }));
   }, [selected]);
 
   // ── Expand helpers ────────────────────────────────────────────────────────
   function toggleExpanded(key: string) {
-    setExpanded((prev) => {
-      const next = new Set(prev);
-      if (next.has(key)) next.delete(key); else next.add(key);
-      return next;
-    });
+    dispatch({ type: "nodeToggled", key });
   }
   function ensureExpanded(skill: string, dirPath: string) {
-    setExpanded((prev) => {
-      const next = new Set(prev);
-      next.add(skill);
-      if (dirPath) {
-        let cur = "";
-        for (const part of dirPath.split("/")) {
-          cur = cur ? `${cur}/${part}` : part;
-          next.add(`${skill}:${cur}`);
-        }
-      }
-      return next;
-    });
+    dispatch({ type: "pathExpanded", skill, dirPath });
   }
 
   // ── Inline create ─────────────────────────────────────────────────────────
   function startCreate(skill: string, inDir: string, kind: "file" | "dir") {
     cancelRef.current = false;
-    ensureExpanded(skill, inDir);
-    setCreating({ skill, inDir, kind });
-    setNewEntryName("");
+    // Also expands the skill and inDir so the input is visible.
+    dispatch({ type: "inlineCreateStarted", skill, inDir, kind });
   }
 
   // Use a ref snapshot so commitCreate reads the latest creating value
@@ -463,8 +449,7 @@ export default function SkillsPage() {
     if (cancelRef.current) { cancelRef.current = false; return; }
     const c = creatingRef.current;
     const name = newEntryRef.current.trim();
-    setCreating(null);
-    setNewEntryName("");
+    dispatch({ type: "inlineCreateEnded" });
     if (!c || !name) return;
 
     const fullPath = c.inDir ? `${c.inDir}/${name}` : name;
@@ -487,15 +472,15 @@ export default function SkillsPage() {
 
   function cancelCreate() {
     cancelRef.current = true;
-    setCreating(null);
-    setNewEntryName("");
+    dispatch({ type: "inlineCreateEnded" });
   }
 
   async function deletePath(skill: string, path: string) {
     try {
       await api.deleteSkillPath(skill, path);
       toast.success(t("Deleted: {path}", { path }));
-      if (selected?.skill === skill && selected.path === path) setSelected(null);
+      // Deselects only when the deleted file is the one open.
+      dispatch({ type: "pathDeleted", skill, path });
       load();
     } catch (e) {
       toast.error(t("Delete failed: {error}", { error: (e as Error).message }));
@@ -506,7 +491,8 @@ export default function SkillsPage() {
     try {
       await api.deleteSkill(name);
       toast.success(t("Skill deleted: {name}", { name }));
-      if (selected?.skill === name) setSelected(null);
+      // Deselects only when the deleted skill is the one open.
+      dispatch({ type: "skillDeleted", skill: name });
       load();
     } catch (e) {
       toast.error(t("Delete failed: {error}", { error: (e as Error).message }));
@@ -516,40 +502,42 @@ export default function SkillsPage() {
   async function runPendingDelete() {
     const p = pendingDelete;
     if (!p) return;
-    setDeleting(true);
+    dispatch({ type: "request/started", key: "delete" });
     try {
       if (p.kind === "skill") await deleteSkill(p.skill);
       else await deletePath(p.skill, p.path);
     } finally {
-      setDeleting(false);
+      dispatch({ type: "request/finished", key: "delete" });
       setPendingDelete(null);
     }
   }
 
   async function saveFile() {
     if (!selected || selected.path === null) return;
-    setSaving(true);
+    dispatch({ type: "request/started", key: "saveFile" });
     try {
       await api.writeSkillFile(selected.skill, selected.path, fileContent);
       toast.success(t("Saved"));
-      setDirty(false);
+      dispatch({ type: "fileSaved" });
     } catch (e) {
       toast.error(t("Save failed: {error}", { error: (e as Error).message }));
-    } finally { setSaving(false); }
+    } finally {
+      dispatch({ type: "request/finished", key: "saveFile" });
+    }
   }
 
   async function toggleSkillMcp(skillName: string, mcpName: string, mcpOn: boolean) {
     const next = mcpOn
       ? [...detailMcps, mcpName]
       : detailMcps.filter((n) => n !== mcpName);
-    setDetailMcps(next);
+    dispatch({ type: "detailMcpsSet", mcps: next });
     try {
       await api.updateSkillMeta(skillName, { mcps: next });
       toast.success(mcpOn ? t('Linked "{name}"', { name: mcpName }) : t('Unlinked "{name}"', { name: mcpName }));
       load();
     } catch (e) {
       // roll back on error
-      setDetailMcps(detailMcps);
+      dispatch({ type: "detailMcpsSet", mcps: detailMcps });
       toast.error(t("Operation failed: {error}", { error: (e as Error).message }));
     }
   }
@@ -564,7 +552,7 @@ export default function SkillsPage() {
           : t('Granted visibility to "{name}"', { name: agentName }),
       );
       const ids = await api.skillVisibility(skillName);
-      setVisibility((v) => ({ ...v, [skillName]: ids }));
+      dispatch({ type: "visibilityLoaded", skill: skillName, ids });
     } catch (e) {
       toast.error(t("Operation failed: {error}", { error: (e as Error).message }));
     }
@@ -573,7 +561,7 @@ export default function SkillsPage() {
   async function createNewSkill() {
     if (!newName.trim()) { toast.error(t("Please fill in the name")); return; }
     if (!newDesc.trim()) { toast.error(t("description is required")); return; }
-    setCreatingSkill(true);
+    dispatch({ type: "request/started", key: "createSkill" });
     try {
       const name = newName.trim();
       await api.createSkill({
@@ -586,13 +574,14 @@ export default function SkillsPage() {
       // apply initial visibility (fire-and-forget per agent; best-effort)
       await Promise.all(newVisibility.map((id) => api.toggleSkillVisibility(id, name, true)));
       toast.success(t("Skill created"));
-      setNewOpen(false);
-      setNewName(""); setNewDesc(""); setNewLicense(""); setNewCompat(""); setNewInst("");
-      setNewMcps([]); setNewVisibility([]);
+      // Closes the dialog and resets the form.
+      dispatch({ type: "newSkillCreated" });
       load();
     } catch (e) {
       toast.error(t("Create failed: {error}", { error: (e as Error).message }));
-    } finally { setCreatingSkill(false); }
+    } finally {
+      dispatch({ type: "request/finished", key: "createSkill" });
+    }
   }
 
   // ── Inline input JSX helper (NOT a React component — avoids remount on re-render) ──
@@ -613,7 +602,7 @@ export default function SkillsPage() {
           className="h-6 flex-1 px-1 py-0 font-mono text-xs"
           placeholder={creating?.kind === "dir" ? "folder-name" : "filename.py"}
           value={newEntryName}
-          onChange={(e) => setNewEntryName(e.target.value)}
+          onChange={(e) => dispatch({ type: "inlineCreateNameChanged", name: e.target.value })}
           onKeyDown={(e) => {
             if (e.key === "Enter") { cancelRef.current = false; void commitCreate(); }
             if (e.key === "Escape") cancelCreate();
@@ -745,7 +734,12 @@ export default function SkillsPage() {
         {/* ── left file tree ── */}
         <div className="flex w-64 shrink-0 flex-col border-r">
           <div className="flex flex-col gap-2 border-b p-2">
-            <Button size="sm" variant="outline" className="w-full" onClick={() => setNewOpen(true)}>
+            <Button
+              size="sm"
+              variant="outline"
+              className="w-full"
+              onClick={() => dispatch({ type: "newSkillOpenChanged", open: true })}
+            >
               <PlusIcon className="size-3.5" />
               {t("Create skill")}
             </Button>
@@ -999,7 +993,7 @@ export default function SkillsPage() {
                 <Textarea
                   className="flex-1 resize-none font-mono text-xs"
                   value={fileContent}
-                  onChange={(e) => { setFileContent(e.target.value); setDirty(true); }}
+                  onChange={(e) => dispatch({ type: "fileEdited", content: e.target.value })}
                 />
               )}
             </div>
@@ -1037,7 +1031,7 @@ export default function SkillsPage() {
       </AlertDialog>
 
       {/* ── create skill dialog ── */}
-      <Sheet open={newOpen} onOpenChange={setNewOpen}>
+      <Sheet open={newOpen} onOpenChange={(open) => dispatch({ type: "newSkillOpenChanged", open })}>
         <SheetContent side="right" className="flex w-full flex-col gap-0 data-[side=right]:sm:max-w-xl">
           <SheetHeader className="px-4 pt-4">
             <SheetTitle>{t("Create skill")}</SheetTitle>
@@ -1067,23 +1061,38 @@ export default function SkillsPage() {
             <TabsContent value="basic" className="flex min-h-0 flex-1 flex-col gap-4 overflow-y-auto px-4 pb-4 pt-4 data-[state=inactive]:hidden">
               <div className="grid gap-1.5">
                 <Label htmlFor="sk-name">{t("Name")} <span className="text-destructive">*</span></Label>
-                <Input id="sk-name" placeholder="sqli-deepdive" value={newName} onChange={(e) => setNewName(e.target.value)} />
+                <Input
+                  id="sk-name"
+                  placeholder="sqli-deepdive"
+                  value={newName}
+                  onChange={(e) => setNewField({ name: e.target.value })}
+                />
                 <p className="text-muted-foreground text-xs">{t("Lowercase letters / digits / hyphens, 1–64 characters")}</p>
               </div>
               <div className="grid gap-1.5">
                 <Label htmlFor="sk-desc">{t("Description")} <span className="text-destructive">*</span></Label>
                 <Textarea id="sk-desc" rows={2} className="resize-none"
                   placeholder={t("What this skill does and when to use it.")}
-                  value={newDesc} onChange={(e) => setNewDesc(e.target.value)} />
+                  value={newDesc}
+                  onChange={(e) => setNewField({ desc: e.target.value })}
+                />
               </div>
               <div className="grid grid-cols-2 gap-3">
                 <div className="grid gap-1.5">
                   <Label className="text-muted-foreground text-xs">license</Label>
-                  <Input placeholder={t("MIT / Proprietary")} value={newLicense} onChange={(e) => setNewLicense(e.target.value)} />
+                  <Input
+                    placeholder={t("MIT / Proprietary")}
+                    value={newLicense}
+                    onChange={(e) => setNewField({ license: e.target.value })}
+                  />
                 </div>
                 <div className="grid gap-1.5">
                   <Label className="text-muted-foreground text-xs">compatibility</Label>
-                  <Input placeholder={t("Requires sqlmap, python3")} value={newCompat} onChange={(e) => setNewCompat(e.target.value)} />
+                  <Input
+                    placeholder={t("Requires sqlmap, python3")}
+                    value={newCompat}
+                    onChange={(e) => setNewField({ compat: e.target.value })}
+                  />
                 </div>
               </div>
               <div className="flex min-h-0 flex-1 flex-col gap-1.5">
@@ -1096,7 +1105,9 @@ export default function SkillsPage() {
                   placeholder={t(
                     "## How to run\n\n1. Probe for errors first\n2. Distinguish blind injection types\n\nScripts go in the scripts/ directory.",
                   )}
-                  value={newInst} onChange={(e) => setNewInst(e.target.value)} />
+                  value={newInst}
+                  onChange={(e) => setNewField({ inst: e.target.value })}
+                />
               </div>
             </TabsContent>
 
@@ -1111,9 +1122,7 @@ export default function SkillsPage() {
                     <label key={m.id} className="flex cursor-pointer items-center gap-2 text-sm">
                       <Checkbox
                         checked={newMcps.includes(m.name)}
-                        onCheckedChange={(on) =>
-                          setNewMcps((cur) => on ? [...cur, m.name] : cur.filter((n) => n !== m.name))
-                        }
+                        onCheckedChange={(on) => dispatch({ type: "newSkillMcpToggled", name: m.name, on: !!on })}
                       />
                       {m.name}
                     </label>
@@ -1133,9 +1142,7 @@ export default function SkillsPage() {
                     <label key={a.key} className="flex cursor-pointer items-center gap-2 text-sm">
                       <Checkbox
                         checked={newVisibility.includes(a.id)}
-                        onCheckedChange={(on) =>
-                          setNewVisibility((cur) => on ? [...cur, a.id] : cur.filter((id) => id !== a.id))
-                        }
+                        onCheckedChange={(on) => dispatch({ type: "newSkillAgentToggled", id: a.id, on: !!on })}
                       />
                       {a.name}
                     </label>
@@ -1146,7 +1153,9 @@ export default function SkillsPage() {
           </Tabs>
 
           <SheetFooter className="flex-row justify-end gap-2 border-t px-4 py-3">
-            <Button variant="outline" onClick={() => setNewOpen(false)}>{t("Cancel")}</Button>
+            <Button variant="outline" onClick={() => dispatch({ type: "newSkillOpenChanged", open: false })}>
+              {t("Cancel")}
+            </Button>
             <Button onClick={createNewSkill} disabled={creatingSkill}>{creatingSkill ? t("Creating…") : t("Create")}</Button>
           </SheetFooter>
         </SheetContent>

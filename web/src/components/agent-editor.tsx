@@ -23,11 +23,21 @@ import {
   DialogTrigger,
 } from "@/components/ui/dialog";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
+import {
+  type AgentEditorForm,
+  agentEditorReducer,
+  initialAgentEditorState,
+} from "@/components/_state/agent-editor.reducer";
+import {
+  agentTriggersTabReducer,
+  createAgentTriggersTabState,
+  type TriggerForm,
+} from "@/components/_state/agent-triggers-tab.reducer";
 import { Markdown } from "@/components/markdown";
 import { intlLocale, t } from "@/i18n";
 import { api } from "@/lib/api";
 import { cn } from "@/lib/utils";
-import type { Agent, AgentDetail, AgentTrigger, MCPServer, PromptVar, PromptVersion, Settings, SkillItem, Tool } from "@/lib/types";
+import type { Agent, AgentTrigger, Tool } from "@/lib/types";
 
 // Renders a translated string, turning <b>…</b> spans into bold elements, so a sentence with emphasis stays one key.
 function rich(s: string): React.ReactNode[] {
@@ -42,44 +52,50 @@ const TRAFFIC_TOOL_KEYS = new Set(["traffic_search", "traffic_get"]);
 // drawer (and reused full-page for deep links). Tabs: Config & Prompt / MCP / Skill /
 // Tools. Config + prompt save as before; visibility + tool bindings toggle live.
 export function AgentEditor({ agentKey, onSaved }: { agentKey: string; onSaved?: () => void }) {
-  const [detail, setDetail] = React.useState<AgentDetail | null>(null);
-  const [versions, setVersions] = React.useState<PromptVersion[]>([]);
-  const [variables, setVariables] = React.useState<PromptVar[]>([]);
-  const [mcp, setMcp] = React.useState<MCPServer[]>([]);
-  const [skills, setSkills] = React.useState<SkillItem[]>([]);
-  const [tools, setTools] = React.useState<Tool[]>([]);
-  const [loaded, setLoaded] = React.useState(false);
-  const [viewVer, setViewVer] = React.useState<PromptVersion | null>(null);
-  const [diffVer, setDiffVer] = React.useState<PromptVersion | null>(null);
-
-  const [prompt, setPrompt] = React.useState("");
-  const [mcpVisible, setMcpVisible] = React.useState<number[]>([]);
-  const [skillVisible, setSkillVisible] = React.useState<string[]>([]);
-  const [preview, setPreview] = React.useState("");
-  const [maxTurns, setMaxTurns] = React.useState("0");
-  const [runSecs, setRunSecs] = React.useState("600");
-  // "" = follow (unbound); otherwise a profile id string
-  const [llmProfileId, setLlmProfileId] = React.useState("");
-  const [llmProfiles, setLlmProfiles] = React.useState<NonNullable<AgentDetail["llm_profiles"]>>([]);
-  const [webSearch, setWebSearch] = React.useState(false);
-  const [interactiveShell, setInteractiveShell] = React.useState(false);
-  const [wrapup, setWrapup] = React.useState("");
-  const [wrapupDefault, setWrapupDefault] = React.useState("");
-  const [wrapupTurns, setWrapupTurns] = React.useState("0");
-  const [wrapupTurnsDefault, setWrapupTurnsDefault] = React.useState(5);
-  // task-level timeout wrap-up prompt (worker/planner only)
-  const [ttSupported, setTtSupported] = React.useState(false);
-  const [ttWrapup, setTtWrapup] = React.useState("");
-  const [ttWrapupDefault, setTtWrapupDefault] = React.useState("");
-  const [ttTurns, setTtTurns] = React.useState("0");
-  const [ttTurnsDefault, setTtTurnsDefault] = React.useState(5);
-  const [settings, setSettings] = React.useState<Settings | null>(null);
+  const [state, dispatch] = React.useReducer(agentEditorReducer, initialAgentEditorState);
+  const { detail, loaded, versions, variables, llmProfiles } = state.agent;
+  const {
+    wrapup: wrapupDefault,
+    wrapupTurns: wrapupTurnsDefault,
+    ttSupported,
+    ttWrapup: ttWrapupDefault,
+    ttTurns: ttTurnsDefault,
+  } = state.defaults;
+  const {
+    prompt,
+    maxTurns,
+    runSecs,
+    llmProfileId,
+    webSearch,
+    interactiveShell,
+    wrapup,
+    wrapupTurns,
+    ttWrapup,
+    ttTurns,
+  } = state.form;
+  const { mcp: mcpVisible, skill: skillVisible } = state.visibility;
+  const { mcp, skills, tools, settings } = state.catalog;
+  const { viewing: viewVer, diffing: diffVer } = state.versionDialogs;
+  const { preview } = state;
+  const setForm = (patch: Partial<AgentEditorForm>) => dispatch({ type: "formFieldChanged", patch });
 
   React.useEffect(() => {
-    api.mcpServers().then(setMcp).catch(() => {});
-    api.skills().then(setSkills).catch(() => {});
-    api.tools().then(setTools).catch(() => {});
-    api.settings().then(setSettings).catch(() => {});
+    api
+      .mcpServers()
+      .then((v) => dispatch({ type: "catalogLoaded", patch: { mcp: v } }))
+      .catch(() => {});
+    api
+      .skills()
+      .then((v) => dispatch({ type: "catalogLoaded", patch: { skills: v } }))
+      .catch(() => {});
+    api
+      .tools()
+      .then((v) => dispatch({ type: "catalogLoaded", patch: { tools: v } }))
+      .catch(() => {});
+    api
+      .settings()
+      .then((v) => dispatch({ type: "catalogLoaded", patch: { settings: v } }))
+      .catch(() => {});
   }, []);
   // global gates: traffic tools need traffic capture, web search needs the master switch.
   const captureOn = !!settings?.traffic_capture;
@@ -88,31 +104,9 @@ export function AgentEditor({ agentKey, onSaved }: { agentKey: string; onSaved?:
   const reload = React.useCallback(() => {
     api
       .getAgent(agentKey)
-      .then((d) => {
-        setDetail(d);
-        setPrompt(d.prompt ?? "");
-        setVariables(d.variables ?? []);
-        setVersions(d.versions ?? []);
-        setMcpVisible(d.visibility?.mcp ?? []);
-        setSkillVisible(d.visibility?.skill ?? []);
-        setMaxTurns(String(d.agent?.max_turns ?? 0));
-        setRunSecs(String(d.agent?.run_seconds ?? 600));
-        setLlmProfileId(d.agent?.llm_profile_id != null ? String(d.agent.llm_profile_id) : "");
-        setLlmProfiles(d.llm_profiles ?? []);
-        setWebSearch(!!d.agent?.web_search);
-        setInteractiveShell(!!d.agent?.interactive_shell);
-        setWrapup(d.wrapup_prompt ?? "");
-        setWrapupDefault(d.wrapup_default ?? "");
-        setWrapupTurns(String(d.wrapup_max_turns ?? 0));
-        setWrapupTurnsDefault(d.wrapup_max_turns_default ?? 5);
-        setTtSupported(!!d.task_timeout_wrapup_supported);
-        setTtWrapup(d.task_timeout_wrapup_prompt ?? "");
-        setTtWrapupDefault(d.task_timeout_wrapup_default ?? "");
-        setTtTurns(String(d.task_timeout_wrapup_max_turns ?? 0));
-        setTtTurnsDefault(d.task_timeout_wrapup_max_turns_default ?? 5);
-      })
-      .catch(() => setDetail(null))
-      .finally(() => setLoaded(true));
+      .then((d) => dispatch({ type: "agentLoaded", detail: d }))
+      .catch(() => dispatch({ type: "agentLoadFailed" }))
+      .finally(() => dispatch({ type: "agentLoadFinished" }));
   }, [agentKey]);
   React.useEffect(() => {
     reload();
@@ -121,9 +115,12 @@ export function AgentEditor({ agentKey, onSaved }: { agentKey: string; onSaved?:
   async function doPreview() {
     try {
       const r = await api.previewAgentPrompt(agentKey, prompt);
-      setPreview(r.error ? t("Render error: {error}", { error: r.error }) : r.rendered);
+      dispatch({
+        type: "previewRendered",
+        text: r.error ? t("Render error: {error}", { error: r.error }) : r.rendered,
+      });
     } catch (e) {
-      setPreview(t("Preview failed: {error}", { error: (e as Error).message }));
+      dispatch({ type: "previewRendered", text: t("Preview failed: {error}", { error: (e as Error).message }) });
     }
   }
   async function savePrompt() {
@@ -211,15 +208,13 @@ export function AgentEditor({ agentKey, onSaved }: { agentKey: string; onSaved?:
   async function applyVis(nextMcp: number[], nextSkill: string[], okMsg: string) {
     const prevMcp = mcpVisible;
     const prevSkill = skillVisible;
-    setMcpVisible(nextMcp);
-    setSkillVisible(nextSkill);
+    dispatch({ type: "visibilityChanged", patch: { mcp: nextMcp, skill: nextSkill } });
     try {
       await api.setAgentVisibility(agentKey, nextMcp, nextSkill);
       toast.success(okMsg);
       onSaved?.(); // refresh the list so the card's MCP/Skill counts stay in sync
     } catch (e) {
-      setMcpVisible(prevMcp);
-      setSkillVisible(prevSkill);
+      dispatch({ type: "visibilityChanged", patch: { mcp: prevMcp, skill: prevSkill } });
       toast.error(t("Save failed: {error}", { error: (e as Error).message }));
     }
   }
@@ -244,7 +239,7 @@ export function AgentEditor({ agentKey, onSaved }: { agentKey: string; onSaved?:
     const on = tool.agents.includes(agentKey);
     const nextAgents = on ? tool.agents.filter((k) => k !== agentKey) : [...tool.agents, agentKey];
     // optimistic update
-    setTools((ts) => ts.map((x) => (x.key === tool.key ? { ...x, agents: nextAgents } : x)));
+    dispatch({ type: "toolAgentsChanged", key: tool.key, agents: nextAgents });
     try {
       await api.saveTool(tool.key, {
         description: tool.description,
@@ -257,7 +252,10 @@ export function AgentEditor({ agentKey, onSaved }: { agentKey: string; onSaved?:
     } catch (e) {
       toast.error(t("Failed to save tool bindings: {error}", { error: (e as Error).message }));
       reload();
-      api.tools().then(setTools).catch(() => {});
+      api
+        .tools()
+        .then((v) => dispatch({ type: "catalogLoaded", patch: { tools: v } }))
+        .catch(() => {});
     }
   }
 
@@ -299,7 +297,10 @@ export function AgentEditor({ agentKey, onSaved }: { agentKey: string; onSaved?:
                 <div className="grid gap-1.5">
                   <Label htmlFor="llm-profile" className="text-xs">{t("Default model (LLM profile)")}</Label>
                   <div className="flex flex-wrap items-center gap-3">
-                    <Select value={llmProfileId || "__follow__"} onValueChange={(v) => setLlmProfileId(v === "__follow__" ? "" : v)}>
+                    <Select
+                      value={llmProfileId || "__follow__"}
+                      onValueChange={(v) => setForm({ llmProfileId: v === "__follow__" ? "" : v })}
+                    >
                       <SelectTrigger id="llm-profile" className="h-8 w-72">
                         <SelectValue />
                       </SelectTrigger>
@@ -328,12 +329,16 @@ export function AgentEditor({ agentKey, onSaved }: { agentKey: string; onSaved?:
                     <div className="grid gap-1.5">
                       <Label htmlFor="max-turns" className="text-xs">{t("Max loop turns (0 = unlimited)")}</Label>
                       <Input id="max-turns" type="number" min={0} className="h-8 w-32"
-                        value={maxTurns} onChange={(e) => setMaxTurns(e.target.value)} />
+                        value={maxTurns}
+                        onChange={(e) => setForm({ maxTurns: e.target.value })}
+                      />
                     </div>
                     <div className="grid gap-1.5">
                       <Label htmlFor="run-seconds" className="text-xs">{t("Run duration (seconds, 0 = unlimited)")}</Label>
                       <Input id="run-seconds" type="number" min={0} className="h-8 w-32"
-                        value={runSecs} onChange={(e) => setRunSecs(e.target.value)} />
+                        value={runSecs}
+                        onChange={(e) => setForm({ runSecs: e.target.value })}
+                      />
                     </div>
                   </>
                 )}
@@ -347,7 +352,7 @@ export function AgentEditor({ agentKey, onSaved }: { agentKey: string; onSaved?:
                     id="web-search"
                     checked={webSearch}
                     disabled={!webSearchGlobalOn}
-                    onCheckedChange={setWebSearch}
+                    onCheckedChange={(v) => setForm({ webSearch: v })}
                   />
                   <div className="grid gap-0.5">
                     <Label htmlFor="web-search" className="text-sm">{t("Web search")}</Label>
@@ -364,7 +369,7 @@ export function AgentEditor({ agentKey, onSaved }: { agentKey: string; onSaved?:
                   <Switch
                     id="interactive-shell"
                     checked={interactiveShell}
-                    onCheckedChange={setInteractiveShell}
+                    onCheckedChange={(v) => setForm({ interactiveShell: v })}
                   />
                   <div className="grid gap-0.5">
                     <Label htmlFor="interactive-shell" className="text-sm">{t("Interactive shell")}</Label>
@@ -387,7 +392,9 @@ export function AgentEditor({ agentKey, onSaved }: { agentKey: string; onSaved?:
               {variables.map((v) => (
                 <Tooltip key={v.name}>
                   <TooltipTrigger asChild>
-                    <button type="button" onClick={() => setPrompt((p) => `${p}{{.${v.name}}}`)}
+                    <button
+                      type="button"
+                      onClick={() => dispatch({ type: "variableInserted", name: v.name })}
                       className="hover:bg-muted inline-flex items-center gap-1 rounded-md border bg-muted/40 px-2 py-1 font-mono text-xs">
                       {`{{.${v.name}}}`}
                       <Badge variant="secondary" className="px-1 py-0 text-[10px]">{t(v.source)}</Badge>
@@ -404,7 +411,9 @@ export function AgentEditor({ agentKey, onSaved }: { agentKey: string; onSaved?:
           </div>
 
           <Textarea className="font-mono text-xs" rows={16} value={prompt}
-            placeholder={t("Leave empty to use the built-in default prompt")} onChange={(e) => setPrompt(e.target.value)} />
+            placeholder={t("Leave empty to use the built-in default prompt")}
+            onChange={(e) => setForm({ prompt: e.target.value })}
+          />
 
           <div className="flex flex-wrap gap-2">
             <Dialog>
@@ -448,12 +457,20 @@ export function AgentEditor({ agentKey, onSaved }: { agentKey: string; onSaved?:
                       {new Date(ver.ts).toLocaleDateString(intlLocale, { month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit" })}
                     </span>
                   )}
-                  <Button variant="ghost" size="icon-sm" className="size-6 shrink-0" onClick={() => setViewVer(ver)}
+                  <Button
+                    variant="ghost"
+                    size="icon-sm"
+                    className="size-6 shrink-0"
+                    onClick={() => dispatch({ type: "versionDialogsChanged", patch: { viewing: ver } })}
                     aria-label={t("View version")} title={t("View version")}>
                     <EyeIcon className="size-3" />
                   </Button>
                   {i > 0 && versions[0] && (
-                    <Button variant="ghost" size="icon-sm" className="size-6 shrink-0" onClick={() => setDiffVer(ver)}
+                    <Button
+                      variant="ghost"
+                      size="icon-sm"
+                      className="size-6 shrink-0"
+                      onClick={() => dispatch({ type: "versionDialogsChanged", patch: { diffing: ver } })}
                       aria-label={t("Compare with current")} title={t("Compare with current")}>
                       <GitCompareIcon className="size-3" />
                     </Button>
@@ -467,7 +484,12 @@ export function AgentEditor({ agentKey, onSaved }: { agentKey: string; onSaved?:
           </div>
 
           {/* view-version dialog */}
-          <Dialog open={!!viewVer} onOpenChange={(o) => { if (!o) setViewVer(null); }}>
+          <Dialog
+            open={!!viewVer}
+            onOpenChange={(o) => {
+              if (!o) dispatch({ type: "versionDialogsChanged", patch: { viewing: null } });
+            }}
+          >
             <DialogContent className="sm:max-w-2xl">
               <DialogHeader>
                 <DialogTitle>
@@ -491,15 +513,14 @@ export function AgentEditor({ agentKey, onSaved }: { agentKey: string; onSaved?:
               <div className="flex gap-2 justify-end">
                 {viewVer && viewVer.version !== versions[0]?.version && (
                   <Button variant="outline" size="sm" onClick={() => {
-                    if (viewVer) { setDiffVer(viewVer); setViewVer(null); }
+                    if (viewVer) dispatch({ type: "viewedVersionCompared" });
                   }}>
                     <GitCompareIcon className="mr-1 size-3.5" /> {t("Compare with current")}
                   </Button>
                 )}
                 <Button size="sm" onClick={() => {
                   if (viewVer) {
-                    setPrompt(viewVer.template_text);
-                    setViewVer(null);
+                    dispatch({ type: "viewedVersionLoaded" });
                     toast.success(
                       t('Loaded v{version} into the editor; click "Save as new version" to confirm', { version: viewVer.version }),
                     );
@@ -512,7 +533,12 @@ export function AgentEditor({ agentKey, onSaved }: { agentKey: string; onSaved?:
           </Dialog>
 
           {/* version-diff dialog */}
-          <Dialog open={!!diffVer} onOpenChange={(o) => { if (!o) setDiffVer(null); }}>
+          <Dialog
+            open={!!diffVer}
+            onOpenChange={(o) => {
+              if (!o) dispatch({ type: "versionDialogsChanged", patch: { diffing: null } });
+            }}
+          >
             <DialogContent className="sm:max-w-3xl">
               <DialogHeader>
                 <DialogTitle>
@@ -557,7 +583,7 @@ export function AgentEditor({ agentKey, onSaved }: { agentKey: string; onSaved?:
             rows={10}
             value={wrapup}
             placeholder={wrapupDefault || t("Leave empty to use the built-in default wrap-up prompt")}
-            onChange={(e) => setWrapup(e.target.value)}
+            onChange={(e) => setForm({ wrapup: e.target.value })}
           />
           <div className="grid gap-1.5">
             <Label htmlFor="wrapup-turns" className="text-xs">
@@ -567,7 +593,9 @@ export function AgentEditor({ agentKey, onSaved }: { agentKey: string; onSaved?:
               )}
             </Label>
             <Input id="wrapup-turns" type="number" min={0} className="h-8 w-32"
-              value={wrapupTurns} onChange={(e) => setWrapupTurns(e.target.value)} />
+              value={wrapupTurns}
+              onChange={(e) => setForm({ wrapupTurns: e.target.value })}
+            />
           </div>
           <div className="flex gap-2">
             <Button size="sm" onClick={saveWrapup}>{t("Save")}</Button>
@@ -608,14 +636,16 @@ export function AgentEditor({ agentKey, onSaved }: { agentKey: string; onSaved?:
                 rows={10}
                 value={ttWrapup}
                 placeholder={ttWrapupDefault || t("Leave empty to use the built-in default task timeout wrap-up prompt")}
-                onChange={(e) => setTtWrapup(e.target.value)}
+                onChange={(e) => setForm({ ttWrapup: e.target.value })}
               />
               <div className="grid gap-1.5">
                 <Label htmlFor="tt-turns" className="text-xs">
                   {t("Wrap-up turns (0 = built-in default of {count} turns)", { count: ttTurnsDefault })}
                 </Label>
                 <Input id="tt-turns" type="number" min={0} className="h-8 w-32"
-                  value={ttTurns} onChange={(e) => setTtTurns(e.target.value)} />
+                  value={ttTurns}
+                  onChange={(e) => setForm({ ttTurns: e.target.value })}
+                />
               </div>
               <div className="flex gap-2">
                 <Button size="sm" onClick={saveTaskTimeoutWrapup}>{t("Save")}</Button>
@@ -775,16 +805,38 @@ function DiffView({ oldText, newText }: { oldText: string; newText: string }) {
 // Each trigger fires (schedule/finding found/goal met/task timeout/tool call, multi-select) → a new conversation runs
 // in parallel with the base user message + auto context appended by the backend.
 function AgentTriggersTab({ agentKey, agent }: { agentKey: string; agent?: Agent }) {
-  const [triggers, setTriggers] = React.useState<AgentTrigger[]>([]);
-  const [tools, setTools] = React.useState<Tool[]>([]);
+  const [state, dispatch] = React.useReducer(agentTriggersTabReducer, agent, createAgentTriggersTabState);
+  const { triggers, tools } = state;
   // post-trigger handling policy (per agent); initial value comes from agent detail, saved on change.
-  const [runMode, setRunMode] = React.useState<"serial" | "parallel">(agent?.trigger_run_mode ?? "serial");
-  const [mergeMode, setMergeMode] = React.useState<"by_task" | "all" | "none">(agent?.trigger_merge_mode ?? "all");
-  const [maxParallel, setMaxParallel] = React.useState(String(agent?.trigger_max_parallel ?? 5));
+  const { runMode, mergeMode, maxParallel } = state.behavior;
+  const { editingId, form } = state.editor;
+  const {
+    onInterval,
+    intervalSec,
+    onFinding,
+    onGoalMet,
+    onTaskTimeout,
+    onToolCall,
+    onTaskCreate,
+    intervalMsg,
+    findingMsg,
+    goalMsg,
+    taskTimeoutMsg,
+    toolCallMsg,
+    taskCreateMsg,
+    toolNames,
+  } = form;
+  const saving = state.requests.save.pending;
+  const setForm = (patch: Partial<TriggerForm>) => dispatch({ type: "formFieldChanged", patch });
   React.useEffect(() => {
-    setRunMode(agent?.trigger_run_mode ?? "serial");
-    setMergeMode(agent?.trigger_merge_mode ?? "all");
-    setMaxParallel(String(agent?.trigger_max_parallel ?? 5));
+    dispatch({
+      type: "behaviorSynced",
+      policy: {
+        trigger_run_mode: agent?.trigger_run_mode,
+        trigger_merge_mode: agent?.trigger_merge_mode,
+        trigger_max_parallel: agent?.trigger_max_parallel,
+      },
+    });
   }, [agent?.trigger_run_mode, agent?.trigger_merge_mode, agent?.trigger_max_parallel]);
 
   async function saveBehavior(patch: {
@@ -798,74 +850,35 @@ function AgentTriggersTab({ agentKey, agent }: { agentKey: string; agent?: Agent
       toast.error(t("Failed to save policy: {error}", { error: (e as Error).message }));
     }
   }
-  const [onInterval, setOnInterval] = React.useState(false);
-  const [intervalSec, setIntervalSec] = React.useState("60");
-  const [onFinding, setOnFinding] = React.useState(false);
-  const [onGoalMet, setOnGoalMet] = React.useState(false);
-  const [onTaskTimeout, setOnTaskTimeout] = React.useState(false);
-  const [onToolCall, setOnToolCall] = React.useState(false);
-  const [onTaskCreate, setOnTaskCreate] = React.useState(false);
-  const [intervalMsg, setIntervalMsg] = React.useState("");
-  const [findingMsg, setFindingMsg] = React.useState("");
-  const [goalMsg, setGoalMsg] = React.useState("");
-  const [taskTimeoutMsg, setTaskTimeoutMsg] = React.useState("");
-  const [toolCallMsg, setToolCallMsg] = React.useState("");
-  const [taskCreateMsg, setTaskCreateMsg] = React.useState("");
-  const [toolNames, setToolNames] = React.useState<string[]>([]);
-  const [saving, setSaving] = React.useState(false);
-  // null = create mode; non-null = editing the trigger with that id.
-  const [editingId, setEditingId] = React.useState<number | null>(null);
 
   const reload = React.useCallback(() => {
-    api.agentTriggers(agentKey).then(setTriggers).catch(() => setTriggers([]));
+    api
+      .agentTriggers(agentKey)
+      .then((v) => dispatch({ type: "triggersLoaded", triggers: v }))
+      .catch(() => dispatch({ type: "triggersLoaded", triggers: [] }));
   }, [agentKey]);
   React.useEffect(() => {
     reload();
   }, [reload]);
   React.useEffect(() => {
-    api.tools().then(setTools).catch(() => setTools([]));
+    api
+      .tools()
+      .then((v) => dispatch({ type: "toolsLoaded", tools: v }))
+      .catch(() => dispatch({ type: "toolsLoaded", tools: [] }));
   }, []);
 
   function toggleTool(key: string) {
-    setToolNames((prev) => (prev.includes(key) ? prev.filter((k) => k !== key) : [...prev, key]));
+    dispatch({ type: "toolNameToggled", key });
   }
 
   // resetForm clears the form and returns to "create" mode.
   function resetForm() {
-    setEditingId(null);
-    setOnInterval(false);
-    setIntervalSec("60");
-    setOnFinding(false);
-    setOnGoalMet(false);
-    setOnTaskTimeout(false);
-    setOnToolCall(false);
-    setOnTaskCreate(false);
-    setIntervalMsg("");
-    setFindingMsg("");
-    setGoalMsg("");
-    setTaskTimeoutMsg("");
-    setToolCallMsg("");
-    setTaskCreateMsg("");
-    setToolNames([]);
+    dispatch({ type: "formReset" });
   }
 
   // startEdit fills the form with an existing trigger and enters "edit" mode.
   function startEdit(trg: AgentTrigger) {
-    setEditingId(trg.id);
-    setOnInterval(trg.interval_sec > 0);
-    setIntervalSec(trg.interval_sec > 0 ? String(trg.interval_sec) : "60");
-    setOnFinding(trg.on_finding);
-    setOnGoalMet(trg.on_goal_met);
-    setOnTaskTimeout(trg.on_task_timeout);
-    setOnToolCall(trg.on_tool_call);
-    setOnTaskCreate(trg.on_task_create);
-    setIntervalMsg(trg.interval_message);
-    setFindingMsg(trg.finding_message);
-    setGoalMsg(trg.goal_message);
-    setTaskTimeoutMsg(trg.task_timeout_message);
-    setToolCallMsg(trg.tool_call_message);
-    setTaskCreateMsg(trg.task_create_message);
-    setToolNames(trg.tool_names ?? []);
+    dispatch({ type: "editStarted", trigger: trg });
   }
 
   // submit creates or saves changes based on editingId; editing keeps the trigger's enabled state.
@@ -894,7 +907,7 @@ function AgentTriggersTab({ agentKey, agent }: { agentKey: string; agent?: Agent
       task_create_message: taskCreateMsg.trim(),
       tool_names: onToolCall ? toolNames : [],
     };
-    setSaving(true);
+    dispatch({ type: "request/started", key: "save" });
     try {
       if (editingId != null) {
         const cur = triggers.find((x) => x.id === editingId);
@@ -910,7 +923,7 @@ function AgentTriggersTab({ agentKey, agent }: { agentKey: string; agent?: Agent
       const error = (e as Error).message;
       toast.error(editingId != null ? t("Save failed: {error}", { error }) : t("Add failed: {error}", { error }));
     } finally {
-      setSaving(false);
+      dispatch({ type: "request/finished", key: "save" });
     }
   }
   async function toggleEnabled(trg: AgentTrigger) {
@@ -979,7 +992,7 @@ function AgentTriggersTab({ agentKey, agent }: { agentKey: string; agent?: Agent
               value={runMode}
               onValueChange={(v) => {
                 const rm = v as "serial" | "parallel";
-                setRunMode(rm);
+                dispatch({ type: "behaviorChanged", patch: { runMode: rm } });
                 saveBehavior({ trigger_run_mode: rm });
               }}
             >
@@ -1000,7 +1013,7 @@ function AgentTriggersTab({ agentKey, agent }: { agentKey: string; agent?: Agent
               disabled={runMode === "parallel"}
               onValueChange={(v) => {
                 const mm = v as "by_task" | "all" | "none";
-                setMergeMode(mm);
+                dispatch({ type: "behaviorChanged", patch: { mergeMode: mm } });
                 saveBehavior({ trigger_merge_mode: mm });
               }}
             >
@@ -1024,10 +1037,10 @@ function AgentTriggersTab({ agentKey, agent }: { agentKey: string; agent?: Agent
                 min={0}
                 className="h-8 w-28"
                 value={maxParallel}
-                onChange={(e) => setMaxParallel(e.target.value)}
+                onChange={(e) => dispatch({ type: "behaviorChanged", patch: { maxParallel: e.target.value } })}
                 onBlur={() => {
                   const n = Math.max(0, Math.floor(Number(maxParallel) || 0));
-                  setMaxParallel(String(n));
+                  dispatch({ type: "behaviorChanged", patch: { maxParallel: String(n) } });
                   saveBehavior({ trigger_max_parallel: n });
                 }}
               />
@@ -1062,18 +1075,23 @@ function AgentTriggersTab({ agentKey, agent }: { agentKey: string; agent?: Agent
         {/* schedule */}
         <div className="grid gap-1.5">
           <label className="flex items-center gap-2 text-sm">
-            <Checkbox checked={onInterval} onCheckedChange={(v) => setOnInterval(!!v)} /> {t("Scheduled trigger")}
+            <Checkbox checked={onInterval} onCheckedChange={(v) => setForm({ onInterval: !!v })} />{" "}
+            {t("Scheduled trigger")}
           </label>
           {onInterval && (
             <div className="grid gap-1.5">
               <div className="flex items-center gap-2">
                 <Label htmlFor="tr-interval" className="text-xs">{t("Every")}</Label>
                 <Input id="tr-interval" type="number" min={1} className="h-8 w-24"
-                  value={intervalSec} onChange={(e) => setIntervalSec(e.target.value)} />
+                  value={intervalSec}
+                  onChange={(e) => setForm({ intervalSec: e.target.value })}
+                />
                 <span className="text-muted-foreground text-xs">{t("seconds")}</span>
               </div>
               <Textarea className="text-xs" rows={2} value={intervalMsg}
-                placeholder={t("Message sent to the agent when the schedule fires, e.g. inspect all tasks")} onChange={(e) => setIntervalMsg(e.target.value)} />
+                placeholder={t("Message sent to the agent when the schedule fires, e.g. inspect all tasks")}
+                onChange={(e) => setForm({ intervalMsg: e.target.value })}
+              />
             </div>
           )}
         </div>
@@ -1081,40 +1099,54 @@ function AgentTriggersTab({ agentKey, agent }: { agentKey: string; agent?: Agent
         {/* finding */}
         <div className="grid gap-1.5">
           <label className="flex items-center gap-2 text-sm">
-            <Checkbox checked={onFinding} onCheckedChange={(v) => setOnFinding(!!v)} /> {t("Trigger on finding")}
+            <Checkbox checked={onFinding} onCheckedChange={(v) => setForm({ onFinding: !!v })} />{" "}
+            {t("Trigger on finding")}
           </label>
           {onFinding && (
             <Textarea className="text-xs" rows={2} value={findingMsg}
-              placeholder={t("Message sent to the agent when a finding is found (the system attaches task and finding details)")} onChange={(e) => setFindingMsg(e.target.value)} />
+              placeholder={t(
+                "Message sent to the agent when a finding is found (the system attaches task and finding details)",
+              )}
+              onChange={(e) => setForm({ findingMsg: e.target.value })}
+            />
           )}
         </div>
 
         {/* goal met */}
         <div className="grid gap-1.5">
           <label className="flex items-center gap-2 text-sm">
-            <Checkbox checked={onGoalMet} onCheckedChange={(v) => setOnGoalMet(!!v)} /> {t("Trigger on goal met")}
+            <Checkbox checked={onGoalMet} onCheckedChange={(v) => setForm({ onGoalMet: !!v })} />{" "}
+            {t("Trigger on goal met")}
           </label>
           {onGoalMet && (
             <Textarea className="text-xs" rows={2} value={goalMsg}
-              placeholder={t("Message sent to the agent when a goal is met (the system attaches the task and the met goal)")} onChange={(e) => setGoalMsg(e.target.value)} />
+              placeholder={t(
+                "Message sent to the agent when a goal is met (the system attaches the task and the met goal)",
+              )}
+              onChange={(e) => setForm({ goalMsg: e.target.value })}
+            />
           )}
         </div>
 
         {/* task timeout */}
         <div className="grid gap-1.5">
           <label className="flex items-center gap-2 text-sm">
-            <Checkbox checked={onTaskTimeout} onCheckedChange={(v) => setOnTaskTimeout(!!v)} /> {t("Trigger on task timeout")}
+            <Checkbox checked={onTaskTimeout} onCheckedChange={(v) => setForm({ onTaskTimeout: !!v })} />{" "}
+            {t("Trigger on task timeout")}
           </label>
           {onTaskTimeout && (
             <Textarea className="text-xs" rows={2} value={taskTimeoutMsg}
-              placeholder={t("Message sent to the agent on task timeout (the system attaches the task id and goals)")} onChange={(e) => setTaskTimeoutMsg(e.target.value)} />
+              placeholder={t("Message sent to the agent on task timeout (the system attaches the task id and goals)")}
+              onChange={(e) => setForm({ taskTimeoutMsg: e.target.value })}
+            />
           )}
         </div>
 
         {/* tool call */}
         <div className="grid gap-1.5">
           <label className="flex items-center gap-2 text-sm">
-            <Checkbox checked={onToolCall} onCheckedChange={(v) => setOnToolCall(!!v)} /> {t("Trigger on tool call")}
+            <Checkbox checked={onToolCall} onCheckedChange={(v) => setForm({ onToolCall: !!v })} />{" "}
+            {t("Trigger on tool call")}
           </label>
           {onToolCall && (
             <div className="grid gap-1.5">
@@ -1142,7 +1174,11 @@ function AgentTriggersTab({ agentKey, agent }: { agentKey: string; agent?: Agent
                 </div>
               </div>
               <Textarea className="text-xs" rows={2} value={toolCallMsg}
-                placeholder={t("Message sent to the agent when a tool is called (the system attaches task info, tool input and output)")} onChange={(e) => setToolCallMsg(e.target.value)} />
+                placeholder={t(
+                  "Message sent to the agent when a tool is called (the system attaches task info, tool input and output)",
+                )}
+                onChange={(e) => setForm({ toolCallMsg: e.target.value })}
+              />
             </div>
           )}
         </div>
@@ -1150,11 +1186,16 @@ function AgentTriggersTab({ agentKey, agent }: { agentKey: string; agent?: Agent
         {/* task created */}
         <div className="grid gap-1.5">
           <label className="flex items-center gap-2 text-sm">
-            <Checkbox checked={onTaskCreate} onCheckedChange={(v) => setOnTaskCreate(!!v)} /> {t("Trigger on task created")}
+            <Checkbox checked={onTaskCreate} onCheckedChange={(v) => setForm({ onTaskCreate: !!v })} />{" "}
+            {t("Trigger on task created")}
           </label>
           {onTaskCreate && (
             <Textarea className="text-xs" rows={2} value={taskCreateMsg}
-              placeholder={t("Message sent to the agent when a task is created (the system attaches the task id and goals)")} onChange={(e) => setTaskCreateMsg(e.target.value)} />
+              placeholder={t(
+                "Message sent to the agent when a task is created (the system attaches the task id and goals)",
+              )}
+              onChange={(e) => setForm({ taskCreateMsg: e.target.value })}
+            />
           )}
         </div>
 

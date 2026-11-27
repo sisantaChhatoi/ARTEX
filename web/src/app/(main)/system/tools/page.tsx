@@ -38,24 +38,21 @@ import { t } from "@/i18n";
 import { api } from "@/lib/api";
 import type { Agent, Tool } from "@/lib/types";
 
+import {
+  type CustomToolForm,
+  type CustomToolKind,
+  customToolDialogReducer,
+  type ExecState,
+  initialCustomToolDialogState,
+} from "./_state/custom-tool-dialog.reducer";
+import { createToolEditorState, type ParamRow, toolEditorReducer } from "./_state/tool-editor.reducer";
+import { initialToolsPageState, toolsPageReducer } from "./_state/tools-page.reducer";
+
 // Traffic tools are host tools gated by the global traffic capture switch: bindable, but
 // only usable when capture is on. Keep in sync with traffic.SeedToolMetas.
 const TRAFFIC_TOOL_KEYS = new Set(["traffic_search", "traffic_get"]);
 
-// paramRows flattens schema.properties into an ordered row list for editing.
-// name/type/required are read-only (welded to the Go handler); description/default
-// are editable. Non-scalar params (array/object) can't carry an editable default.
-// parentKey is set for rows that live inside an array param's items.properties.
-type ParamRow = {
-  name: string;
-  type: string;
-  required: boolean;
-  description: string;
-  defaultStr: string; // "" = no default declared
-  scalar: boolean;
-  parentKey?: string; // set when this is a sub-field of an array param's items
-};
-
+// toRows flattens schema.properties into an ordered row list for editing (see ParamRow).
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 function toRows(schema: Record<string, any>): ParamRow[] {
   const props = (schema?.properties ?? {}) as Record<string, Record<string, unknown>>;
@@ -157,19 +154,17 @@ function ToolEditor({
 }) {
   // traffic tools can't be bound/enabled until the global traffic capture switch is on.
   const trafficGated = TRAFFIC_TOOL_KEYS.has(tool.key) && !captureOn;
-  const [description, setDescription] = React.useState(tool.description);
-  const [bound, setBound] = React.useState<string[]>(tool.agents);
-  const [enabled, setEnabled] = React.useState(tool.enabled);
-  const [rows, setRows] = React.useState<ParamRow[]>(() => toRows(tool.schema));
-  const [saving, setSaving] = React.useState(false);
+  const [state, dispatch] = React.useReducer(toolEditorReducer, tool, (initial) =>
+    createToolEditorState(initial, toRows(initial.schema)),
+  );
+  const { description, bound, enabled, rows } = state.form;
+  const saving = state.requests.save.pending;
 
-  const setRow = (i: number, patch: Partial<ParamRow>) =>
-    setRows((rs) => rs.map((r, j) => (j === i ? { ...r, ...patch } : r)));
-  const toggleAgent = (k: string) =>
-    setBound((b) => (b.includes(k) ? b.filter((x) => x !== k) : [...b, k]));
+  const setRow = (i: number, patch: Partial<ParamRow>) => dispatch({ type: "rowChanged", index: i, patch });
+  const toggleAgent = (k: string) => dispatch({ type: "agentToggled", agent: k });
 
   async function save() {
-    setSaving(true);
+    dispatch({ type: "request/started", key: "save" });
     try {
       await api.saveTool(tool.key, {
         description,
@@ -183,7 +178,7 @@ function ToolEditor({
     } catch (e) {
       toast.error(t("Save failed: {error}", { error: (e as Error).message }));
     } finally {
-      setSaving(false);
+      dispatch({ type: "request/finished", key: "save" });
     }
   }
   async function reset() {
@@ -235,7 +230,11 @@ function ToolEditor({
             </div>
           </div>
           <div className="flex items-center gap-2">
-            <Switch checked={enabled} onCheckedChange={setEnabled} id={`en-${tool.key}`} />
+            <Switch
+              checked={enabled}
+              onCheckedChange={(v) => dispatch({ type: "formFieldChanged", patch: { enabled: v } })}
+              id={`en-${tool.key}`}
+            />
             <Label htmlFor={`en-${tool.key}`} className="text-sm">
               {t("Enable")}
             </Label>
@@ -249,7 +248,7 @@ function ToolEditor({
             className="font-mono text-xs"
             rows={6}
             value={description}
-            onChange={(e) => setDescription(e.target.value)}
+            onChange={(e) => dispatch({ type: "formFieldChanged", patch: { description: e.target.value } })}
           />
         </div>
 
@@ -375,22 +374,28 @@ function ToolGridCard({ tool, onClick }: { tool: Tool; onClick: () => void }) {
 }
 
 export default function ToolsPage() {
-  const [tools, setTools] = React.useState<Tool[]>([]);
-  const [agents, setAgents] = React.useState<Agent[]>([]);
-  const [captureOn, setCaptureOn] = React.useState(false);
-  const [selectedKey, setSelectedKey] = React.useState<string | null>(null);
-  const [customEdit, setCustomEdit] = React.useState<Tool | "new" | null>(null);
+  const [state, dispatch] = React.useReducer(toolsPageReducer, initialToolsPageState);
+  const { tools, agents, captureOn } = state.data;
+  const { query } = state;
+  const { selectedKey, customEdit } = state.editing;
 
   const reload = React.useCallback(() => {
-    api.tools().then(setTools).catch(() => setTools([]));
+    api
+      .tools()
+      .then((tools) => dispatch({ type: "toolsLoaded", tools }))
+      .catch(() => dispatch({ type: "toolsLoaded", tools: [] }));
   }, []);
   React.useEffect(() => {
     reload();
-    api.agents().then(setAgents).catch(() => {});
-    api.settings().then((s) => setCaptureOn(!!s.traffic_capture)).catch(() => {});
+    api
+      .agents()
+      .then((agents) => dispatch({ type: "agentsLoaded", agents }))
+      .catch(() => {});
+    api
+      .settings()
+      .then((s) => dispatch({ type: "captureLoaded", captureOn: !!s.traffic_capture }))
+      .catch(() => {});
   }, [reload]);
-
-  const [query, setQuery] = React.useState("");
 
   const selected = tools.find((t) => t.key === selectedKey) ?? null;
   const matchTool = React.useCallback((t: Tool) => {
@@ -407,7 +412,7 @@ export default function ToolsPage() {
   const allSystemCount = tools.filter((t) => t.system).length;
   const allCustomCount = tools.filter((t) => !t.system).length;
   // clicking a built-in tool opens the binding drawer; a custom tool opens its full editor.
-  const openTool = (t: Tool) => (t.system ? setSelectedKey(t.key) : setCustomEdit(t));
+  const openTool = (t: Tool) => dispatch({ type: "toolOpened", tool: t });
 
   return (
     <div className="flex flex-1 flex-col gap-4 md:gap-6">
@@ -422,7 +427,7 @@ export default function ToolsPage() {
             className="h-8 pl-8 text-sm"
             placeholder={t("Search tool name, description, agent…")}
             value={query}
-            onChange={(e) => setQuery(e.target.value)}
+            onChange={(e) => dispatch({ type: "queryChanged", query: e.target.value })}
           />
         </div>
       </div>
@@ -482,7 +487,7 @@ export default function ToolsPage() {
                         )}
                   </CardDescription>
                 </div>
-                <Button size="sm" onClick={() => setCustomEdit("new")}>
+                <Button size="sm" onClick={() => dispatch({ type: "customToolCreateStarted" })}>
                   <PlusIcon /> {t("Create custom tool")}
                 </Button>
               </div>
@@ -504,7 +509,7 @@ export default function ToolsPage() {
         </TabsContent>
       </Tabs>
 
-      <Sheet open={!!selected} onOpenChange={(o) => !o && setSelectedKey(null)}>
+      <Sheet open={!!selected} onOpenChange={(o) => !o && dispatch({ type: "toolEditorClosed" })}>
         <SheetContent
           side="right"
           className="gap-0 p-0 data-[side=right]:w-[30vw] data-[side=right]:sm:max-w-[30vw]"
@@ -521,7 +526,7 @@ export default function ToolsPage() {
                 agents={agents}
                 captureOn={captureOn}
                 onSaved={reload}
-                onClose={() => setSelectedKey(null)}
+                onClose={() => dispatch({ type: "toolEditorClosed" })}
               />
             </>
           )}
@@ -531,9 +536,9 @@ export default function ToolsPage() {
       <CustomToolDialog
         edit={customEdit}
         agents={agents}
-        onClose={() => setCustomEdit(null)}
+        onClose={() => dispatch({ type: "customEditorClosed" })}
         onSaved={() => {
-          setCustomEdit(null);
+          dispatch({ type: "customEditorClosed" });
           reload();
         }}
       />
@@ -542,18 +547,6 @@ export default function ToolsPage() {
 }
 
 // ---- custom tool editor ----
-
-type ExecState = {
-  command: string;
-  code: string;
-  method: string;
-  url: string;
-  headers: string;
-  body: string;
-  timeout_ms: string;
-  proxy: string;
-  use_recording_proxy: boolean;
-};
 
 function CustomToolDialog({
   edit,
@@ -568,54 +561,21 @@ function CustomToolDialog({
 }) {
   const isNew = edit === "new";
   const tool = edit && edit !== "new" ? edit : null;
-  const [key, setKey] = React.useState("");
-  const [description, setDescription] = React.useState("");
-  const [kind, setKind] = React.useState<"shell" | "command" | "script" | "http">("shell");
-  const [ex, setEx] = React.useState<ExecState>({
-    command: "", code: "", method: "GET", url: "", headers: "", body: "", timeout_ms: "", proxy: "", use_recording_proxy: false,
-  });
-  const [schemaText, setSchemaText] = React.useState("");
-  const [bound, setBound] = React.useState<string[]>([]);
-  const [deferred, setDeferred] = React.useState(false);
-  const [enabled, setEnabled] = React.useState(true);
-  const [saving, setSaving] = React.useState(false);
-  const [paramsText, setParamsText] = React.useState("");
-  const [testing, setTesting] = React.useState(false);
-  const [testResult, setTestResult] = React.useState<{ output: string; is_error: boolean } | null>(null);
+  const [state, dispatch] = React.useReducer(customToolDialogReducer, initialCustomToolDialogState);
+  const { key, description, kind, ex, schemaText, bound, deferred, enabled } = state.form;
+  const { paramsText, result: testResult } = state.test;
+  const saving = state.requests.save.pending;
+  const testing = state.requests.test.pending;
+  const setField = (patch: Partial<Omit<CustomToolForm, "ex">>) => dispatch({ type: "formFieldChanged", patch });
+  const setExField = (patch: Partial<ExecState>) => dispatch({ type: "execFieldChanged", patch });
 
   // (re)load form state when opening.
   React.useEffect(() => {
     if (!edit) return;
-    setParamsText(""); setTestResult(null);
-    if (edit === "new") {
-      setKey(""); setDescription(""); setKind("shell");
-      setEx({ command: "", code: "", method: "GET", url: "", headers: "", body: "", timeout_ms: "", proxy: "", use_recording_proxy: false });
-      setSchemaText(""); setBound([]); setDeferred(false); setEnabled(true);
-      return;
-    }
-    const t = edit;
-    const e = (t.exec ?? {}) as Record<string, unknown>;
-    setKey(t.key);
-    setDescription(t.description);
-    setKind((t.kind as "shell" | "command" | "script" | "http") ?? "shell");
-    setEx({
-      command: String(e.command ?? ""),
-      code: String(e.code ?? ""),
-      method: String(e.method ?? "GET"),
-      url: String(e.url ?? ""),
-      headers: e.headers ? JSON.stringify(e.headers, null, 2) : "",
-      body: String(e.body ?? ""),
-      timeout_ms: e.timeout_ms ? String(e.timeout_ms) : "",
-      proxy: String(e.proxy ?? ""),
-      use_recording_proxy: !!e.use_recording_proxy,
-    });
-    setSchemaText(t.schema && Object.keys(t.schema).length ? JSON.stringify(t.schema, null, 2) : "");
-    setBound(t.agents ?? []);
-    setDeferred(!!t.deferred);
-    setEnabled(t.enabled);
+    dispatch({ type: "editLoaded", edit });
   }, [edit]);
 
-  const toggleAgent = (k: string) => setBound((b) => (b.includes(k) ? b.filter((x) => x !== k) : [...b, k]));
+  const toggleAgent = (k: string) => dispatch({ type: "agentToggled", agent: k });
 
   function buildExec(): Record<string, unknown> {
     if (kind === "shell") return {};
@@ -648,7 +608,7 @@ function CustomToolDialog({
         return;
       }
     }
-    setSaving(true);
+    dispatch({ type: "request/started", key: "save" });
     const payload = { description, schema: kind === "shell" ? {} : schema, agents: bound, enabled, kind, exec: buildExec(), deferred: kind === "shell" ? false : deferred };
     try {
       if (isNew) await api.createCustomTool({ key: key.trim(), ...payload });
@@ -658,7 +618,7 @@ function CustomToolDialog({
     } catch (e) {
       toast.error(t("Save failed: {error}", { error: (e as Error).message }));
     } finally {
-      setSaving(false);
+      dispatch({ type: "request/finished", key: "save" });
     }
   }
   async function del() {
@@ -681,16 +641,15 @@ function CustomToolDialog({
     if (kind === "http" && ex.headers.trim()) {
       try { JSON.parse(ex.headers); } catch { toast.error(t("Invalid headers JSON")); return; }
     }
-    setTesting(true);
-    setTestResult(null);
+    dispatch({ type: "testStarted" });
     try {
       // key: a saved tool's stored secrets replace the masked placeholders.
       const r = await api.testCustomTool({ key: tool?.key, kind, exec: buildExec(), params });
-      setTestResult(r);
+      dispatch({ type: "testChanged", patch: { result: r } });
     } catch (e) {
-      setTestResult({ output: (e as Error).message, is_error: true });
+      dispatch({ type: "testChanged", patch: { result: { output: (e as Error).message, is_error: true } } });
     } finally {
-      setTesting(false);
+      dispatch({ type: "request/finished", key: "test" });
     }
   }
 
@@ -713,16 +672,17 @@ function CustomToolDialog({
           <div className="grid gap-1.5">
             <Label className="text-xs">{t("Key")}</Label>
             <Input className="font-mono" placeholder={t("e.g. nmap_scan")} value={key} disabled={!isNew}
-              onChange={(e) => setKey(e.target.value)} />
+              onChange={(e) => setField({ key: e.target.value })}
+            />
           </div>
           <div className="grid gap-1.5">
             <Label className="text-xs">{t("Description (sent to the model)")}</Label>
-            <Textarea rows={2} value={description} onChange={(e) => setDescription(e.target.value)} />
+            <Textarea rows={2} value={description} onChange={(e) => setField({ description: e.target.value })} />
           </div>
 
           <div className="grid gap-1.5">
             <Label className="text-xs">{t("Type")}</Label>
-            <Select value={kind} onValueChange={(v) => setKind(v as "shell" | "command" | "script" | "http")}>
+            <Select value={kind} onValueChange={(v) => setField({ kind: v as CustomToolKind })}>
               <SelectTrigger className="w-56"><SelectValue /></SelectTrigger>
               <SelectContent>
                 <SelectItem value="shell">{t("shell (bash environment declaration)")}</SelectItem>
@@ -740,15 +700,19 @@ function CustomToolDialog({
             <div className="grid gap-1.5">
               <Label className="text-xs">{t("Command template (placeholder {param}, e.g. nmap -p {ports} {target})")}</Label>
               <Textarea className="font-mono text-xs" rows={2} value={ex.command}
-                onChange={(e) => setEx({ ...ex, command: e.target.value })} />
+                onChange={(e) => setExField({ command: e.target.value })}
+              />
             </div>
           )}
           {kind === "script" && (
             <div className="grid gap-1.5">
-              <Label className="text-xs">{t("Python body (params arrive via stdin JSON / os.environ[\"TOOL_X\"])")}</Label>
+              <Label className="text-xs">
+                {t('Python body (params arrive via stdin JSON / os.environ["TOOL_X"])')}
+              </Label>
               <Textarea className="font-mono text-xs" rows={10} value={ex.code}
-                placeholder={'import json,sys\nargs=json.load(sys.stdin)\nprint(...)'}
-                onChange={(e) => setEx({ ...ex, code: e.target.value })} />
+                placeholder={"import json,sys\nargs=json.load(sys.stdin)\nprint(...)"}
+                onChange={(e) => setExField({ code: e.target.value })}
+              />
             </div>
           )}
           {kind === "http" && (
@@ -756,29 +720,47 @@ function CustomToolDialog({
               <div className="flex gap-2">
                 <div className="grid gap-1.5">
                   <Label className="text-xs">{t("Method")}</Label>
-                  <Input className="w-24" value={ex.method} onChange={(e) => setEx({ ...ex, method: e.target.value })} />
+                  <Input className="w-24" value={ex.method} onChange={(e) => setExField({ method: e.target.value })} />
                 </div>
                 <div className="grid flex-1 gap-1.5">
                   <Label className="text-xs">{t("URL (may contain {param})")}</Label>
-                  <Input className="font-mono text-xs" value={ex.url} onChange={(e) => setEx({ ...ex, url: e.target.value })} />
+                  <Input
+                    className="font-mono text-xs"
+                    value={ex.url}
+                    onChange={(e) => setExField({ url: e.target.value })}
+                  />
                 </div>
               </div>
               <div className="grid gap-1.5">
                 <Label className="text-xs">{t("Headers (JSON, may contain {param})")}</Label>
                 <Textarea className="font-mono text-xs" rows={2} value={ex.headers}
-                  placeholder={'{"Authorization": "Bearer {token}"}'} onChange={(e) => setEx({ ...ex, headers: e.target.value })} />
+                  placeholder={'{"Authorization": "Bearer {token}"}'}
+                  onChange={(e) => setExField({ headers: e.target.value })}
+                />
               </div>
               <div className="grid gap-1.5">
                 <Label className="text-xs">{t("Body (may contain {param})")}</Label>
-                <Textarea className="font-mono text-xs" rows={2} value={ex.body} onChange={(e) => setEx({ ...ex, body: e.target.value })} />
+                <Textarea
+                  className="font-mono text-xs"
+                  rows={2}
+                  value={ex.body}
+                  onChange={(e) => setExField({ body: e.target.value })}
+                />
               </div>
               <div className="flex items-center gap-4">
                 <div className="grid gap-1.5">
                   <Label className="text-xs">{t("Proxy URL (empty = direct)")}</Label>
-                  <Input className="font-mono text-xs w-56" value={ex.proxy} onChange={(e) => setEx({ ...ex, proxy: e.target.value })} />
+                  <Input
+                    className="font-mono text-xs w-56"
+                    value={ex.proxy}
+                    onChange={(e) => setExField({ proxy: e.target.value })}
+                  />
                 </div>
                 <label className="mt-4 flex items-center gap-2 text-sm">
-                  <Checkbox checked={ex.use_recording_proxy} onCheckedChange={(v) => setEx({ ...ex, use_recording_proxy: !!v })} />
+                  <Checkbox
+                    checked={ex.use_recording_proxy}
+                    onCheckedChange={(v) => setExField({ use_recording_proxy: !!v })}
+                  />
                   {t("Use recording proxy")}
                 </label>
               </div>
@@ -789,7 +771,12 @@ function CustomToolDialog({
             <div className="flex items-center gap-3">
               <div className="grid gap-1.5">
                 <Label className="text-xs">{t("Timeout (ms, empty = default)")}</Label>
-                <Input type="number" className="w-32" value={ex.timeout_ms} onChange={(e) => setEx({ ...ex, timeout_ms: e.target.value })} />
+                <Input
+                  type="number"
+                  className="w-32"
+                  value={ex.timeout_ms}
+                  onChange={(e) => setExField({ timeout_ms: e.target.value })}
+                />
               </div>
             </div>
           )}
@@ -803,7 +790,8 @@ function CustomToolDialog({
               </Label>
               <Textarea className="font-mono text-xs" rows={4} value={schemaText}
                 placeholder={'{"type":"object","properties":{"target":{"type":"string"}},"required":["target"]}'}
-                onChange={(e) => setSchemaText(e.target.value)} />
+                onChange={(e) => setField({ schemaText: e.target.value })}
+              />
             </div>
           )}
 
@@ -821,11 +809,12 @@ function CustomToolDialog({
 
           <div className="flex items-center gap-6">
             <label className="flex items-center gap-2 text-sm">
-              <Switch checked={enabled} onCheckedChange={setEnabled} /> {t("Enable")}
+              <Switch checked={enabled} onCheckedChange={(v) => setField({ enabled: v })} /> {t("Enable")}
             </label>
             {kind !== "shell" && (
               <label className="flex items-center gap-2 text-sm">
-                <Switch checked={deferred} onCheckedChange={setDeferred} /> {t("deferred (enable only for many rarely-used tools)")}
+                <Switch checked={deferred} onCheckedChange={(v) => setField({ deferred: v })} />{" "}
+                {t("deferred (enable only for many rarely-used tools)")}
               </label>
             )}
           </div>
@@ -835,7 +824,8 @@ function CustomToolDialog({
               <Label className="text-xs font-medium">{t("Test run (uses the current form, nothing is saved)")}</Label>
               <Textarea className="font-mono text-xs" rows={2} value={paramsText}
                 placeholder={t('Sample params JSON, e.g. {"target":"example.com"}')}
-                onChange={(e) => setParamsText(e.target.value)} />
+                onChange={(e) => dispatch({ type: "testChanged", patch: { paramsText: e.target.value } })}
+              />
               <div>
                 <Button size="sm" variant="outline" onClick={runTest} disabled={testing}>
                   <PlayIcon /> {testing ? t("Running…") : t("Test run")}

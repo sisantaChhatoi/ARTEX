@@ -16,6 +16,12 @@ import { api } from "@/lib/api";
 import { CHAT_SEND_MODE_OPTIONS, type ChatSendMode, setChatSendMode, useChatSendMode } from "@/lib/chat-send-mode";
 import type { Settings } from "@/lib/types";
 
+import {
+  initialSystemSettingsPageState,
+  type SettingsSwitch,
+  systemSettingsPageReducer,
+} from "./_state/system-settings-page.reducer";
+
 import { NoiseProfileCard } from "./noise-profile-card";
 
 // Renders a translated string, turning <b>…</b> and <code>…</code> spans into elements, so a sentence with emphasis stays one key.
@@ -30,53 +36,35 @@ function rich(s: string): React.ReactNode[] {
 }
 
 export default function SystemSettingsPage() {
-  const [trafficCapture, setTrafficCapture] = React.useState(false);
-  const [agentTrafficBinding, setAgentTrafficBinding] = React.useState(false);
-  const [webSearch, setWebSearch] = React.useState(false);
-  const [backend, setBackend] = React.useState("ddgs");
-  const [braveKeySet, setBraveKeySet] = React.useState(false);
-  const [braveKeyInput, setBraveKeyInput] = React.useState("");
-  const [tavilyKeySet, setTavilyKeySet] = React.useState(false);
-  const [tavilyKeyInput, setTavilyKeyInput] = React.useState("");
-  const [savingTavilyKey, setSavingTavilyKey] = React.useState(false);
-  const [keenableKeySet, setKeenableKeySet] = React.useState(false);
-  const [keenableKeyInput, setKeenableKeyInput] = React.useState("");
-  const [savingKeenableKey, setSavingKeenableKey] = React.useState(false);
-  const [proxyInput, setProxyInput] = React.useState("");
-  const [savingProxy, setSavingProxy] = React.useState(false);
-  const [globalProxyInput, setGlobalProxyInput] = React.useState("");
-  const [savingGlobalProxy, setSavingGlobalProxy] = React.useState(false);
-  const [testing, setTesting] = React.useState(false);
-  const [loaded, setLoaded] = React.useState(false);
-  const [saving, setSaving] = React.useState(false);
-  const [savingKey, setSavingKey] = React.useState(false);
-  const [pyInterp, setPyInterp] = React.useState("");
-  const [workers, setWorkers] = React.useState("3");
-  const [savingWorkers, setSavingWorkers] = React.useState(false);
-  // Operation constraint injection scope (both on by default).
-  const [injectPlanner, setInjectPlanner] = React.useState(true);
-  const [injectWorker, setInjectWorker] = React.useState(true);
-  // Experimental: noa context compaction (off by default).
-  const [noaCompaction, setNoaCompaction] = React.useState(false);
+  const [state, dispatch] = React.useReducer(systemSettingsPageReducer, initialSystemSettingsPageState);
+  const {
+    loaded,
+    switches,
+    webSearch: webSearchState,
+    apiKeys,
+    globalProxy: globalProxyInput,
+    runtime,
+    requests,
+  } = state;
+  const { trafficCapture, agentTrafficBinding, injectPlanner, injectWorker, noaCompaction } = switches;
+  const { enabled: webSearch, backend, proxy: proxyInput } = webSearchState;
+  const { set: braveKeySet, input: braveKeyInput } = apiKeys.brave;
+  const { set: tavilyKeySet, input: tavilyKeyInput } = apiKeys.tavily;
+  const { set: keenableKeySet, input: keenableKeyInput } = apiKeys.keenable;
+  const { pythonInterpreter: pyInterp, workers } = runtime;
+  const saving = requests.save.pending;
+  const savingKey = requests.braveKey.pending;
+  const savingTavilyKey = requests.tavilyKey.pending;
+  const savingKeenableKey = requests.keenableKey.pending;
+  const savingProxy = requests.proxy.pending;
+  const savingGlobalProxy = requests.globalProxy.pending;
+  const savingWorkers = requests.workers.pending;
+  const testing = requests.test.pending;
   // Pure frontend preference: bypasses /api/settings, reads and writes localStorage directly.
   const sendMode = useChatSendMode();
 
-  const apply = React.useCallback((s: Settings) => {
-    setTrafficCapture(!!s.traffic_capture);
-    setAgentTrafficBinding(!!s.agent_traffic_binding);
-    setWebSearch(!!s.web_search_enabled);
-    setBackend(s.web_search_backend || "ddgs");
-    setBraveKeySet(!!s.brave_key_set);
-    setTavilyKeySet(!!s.tavily_key_set);
-    setKeenableKeySet(!!s.keenable_key_set);
-    setProxyInput(s.web_search_proxy ?? "");
-    setGlobalProxyInput(s.global_proxy ?? "");
-    setPyInterp(s.python_interpreter ?? "");
-    setWorkers(String(s.workers ?? 3));
-    setInjectPlanner(s.constraints_inject_planner !== false);
-    setInjectWorker(s.constraints_inject_worker !== false);
-    setNoaCompaction(!!s.noa_compaction);
-  }, []);
+  const apply = React.useCallback((s: Settings) => dispatch({ type: "settingsLoaded", settings: s }), []);
+  const setSwitch = (key: SettingsSwitch, value: boolean) => dispatch({ type: "switchChanged", key, value });
 
   const saveWorkers = () => {
     const n = Number(workers);
@@ -84,7 +72,7 @@ export default function SystemSettingsPage() {
       toast.error(t("Concurrency must be an integer greater than 0"));
       return;
     }
-    setSavingWorkers(true);
+    dispatch({ type: "request/started", key: "workers" });
     api
       .setSettings({ workers: n })
       .then((s) => {
@@ -92,11 +80,11 @@ export default function SystemSettingsPage() {
         toast.success(t("Saved the concurrent worker agent count (applies to tasks started afterwards)"));
       })
       .catch((e) => toast.error(t("Save failed: {error}", { error: (e as Error).message })))
-      .finally(() => setSavingWorkers(false));
+      .finally(() => dispatch({ type: "request/finished", key: "workers" }));
   };
 
   const savePython = () => {
-    setSaving(true);
+    dispatch({ type: "request/started", key: "save" });
     api
       .setSettings({ python_interpreter: pyInterp.trim() })
       .then((s) => {
@@ -104,15 +92,15 @@ export default function SystemSettingsPage() {
         toast.success(t("Saved Python interpreter config"));
       })
       .catch((e) => toast.error(t("Save failed: {error}", { error: (e as Error).message })))
-      .finally(() => setSaving(false));
+      .finally(() => dispatch({ type: "request/finished", key: "save" }));
   };
   const detectPython = () => {
-    setSaving(true);
+    dispatch({ type: "request/started", key: "save" });
     api
       .detectPython()
-      .then((r) => setPyInterp(r.python_interpreter))
+      .then((r) => dispatch({ type: "runtimeChanged", patch: { pythonInterpreter: r.python_interpreter } }))
       .catch(() => undefined)
-      .finally(() => setSaving(false));
+      .finally(() => dispatch({ type: "request/finished", key: "save" }));
   };
 
   React.useEffect(() => {
@@ -120,30 +108,30 @@ export default function SystemSettingsPage() {
       .settings()
       .then(apply)
       .catch(() => undefined)
-      .finally(() => setLoaded(true));
+      .finally(() => dispatch({ type: "loadFinished" }));
   }, [apply]);
 
   const toggleTraffic = (v: boolean) => {
-    setTrafficCapture(v); // optimistic
-    setSaving(true);
+    setSwitch("trafficCapture", v); // optimistic
+    dispatch({ type: "request/started", key: "save" });
     api
       .setSettings({ traffic_capture: v })
       .then(apply)
-      .catch(() => setTrafficCapture(!v)) // revert on failure
-      .finally(() => setSaving(false));
+      .catch(() => setSwitch("trafficCapture", !v)) // revert on failure
+      .finally(() => dispatch({ type: "request/finished", key: "save" }));
   };
 
   const toggleInjectPlanner = (v: boolean) => {
-    setInjectPlanner(v); // optimistic
+    setSwitch("injectPlanner", v); // optimistic
     api
       .setSettings({ constraints_inject_planner: v })
       .then(apply)
-      .catch(() => setInjectPlanner(!v)); // revert on failure
+      .catch(() => setSwitch("injectPlanner", !v)); // revert on failure
   };
 
   const toggleAgentTrafficBinding = (v: boolean) => {
-    setAgentTrafficBinding(v);
-    setSaving(true);
+    setSwitch("agentTrafficBinding", v);
+    dispatch({ type: "request/started", key: "save" });
     api
       .setSettings({ agent_traffic_binding: v })
       .then((s) => {
@@ -151,22 +139,22 @@ export default function SystemSettingsPage() {
         toast.success(v ? t("Enabled automatic agent traffic binding") : t("Disabled automatic agent traffic binding"));
       })
       .catch((e) => {
-        setAgentTrafficBinding(!v);
+        setSwitch("agentTrafficBinding", !v);
         toast.error(t("Save failed: {error}", { error: (e as Error).message }));
       })
-      .finally(() => setSaving(false));
+      .finally(() => dispatch({ type: "request/finished", key: "save" }));
   };
 
   const toggleInjectWorker = (v: boolean) => {
-    setInjectWorker(v); // optimistic
+    setSwitch("injectWorker", v); // optimistic
     api
       .setSettings({ constraints_inject_worker: v })
       .then(apply)
-      .catch(() => setInjectWorker(!v)); // revert on failure
+      .catch(() => setSwitch("injectWorker", !v)); // revert on failure
   };
 
   const toggleNoaCompaction = (v: boolean) => {
-    setNoaCompaction(v); // optimistic
+    setSwitch("noaCompaction", v); // optimistic
     api
       .setSettings({ noa_compaction: v })
       .then((s) => {
@@ -178,14 +166,14 @@ export default function SystemSettingsPage() {
         );
       })
       .catch((e) => {
-        setNoaCompaction(!v); // revert on failure
+        setSwitch("noaCompaction", !v); // revert on failure
         toast.error(t("Save failed: {error}", { error: (e as Error).message }));
       });
   };
 
   // Persist a web-search patch (enable and/or backend). Optimistic with refetch.
   const saveWebSearch = (patch: Partial<Settings>) => {
-    setSaving(true);
+    dispatch({ type: "request/started", key: "save" });
     api
       .setSettings(patch)
       .then((s) => {
@@ -199,50 +187,47 @@ export default function SystemSettingsPage() {
           .then(apply)
           .catch(() => undefined);
       })
-      .finally(() => setSaving(false));
+      .finally(() => dispatch({ type: "request/finished", key: "save" }));
   };
 
   const saveBraveKey = () => {
-    setSavingKey(true);
+    dispatch({ type: "request/started", key: "braveKey" });
     api
       .setSettings({ brave_search_api_key: braveKeyInput })
       .then((s) => {
-        apply(s);
-        setBraveKeyInput("");
+        dispatch({ type: "apiKeySaved", provider: "brave", settings: s });
         toast.success(t("Saved Brave API Key"));
       })
       .catch((e) => toast.error(t("Save failed: {error}", { error: (e as Error).message })))
-      .finally(() => setSavingKey(false));
+      .finally(() => dispatch({ type: "request/finished", key: "braveKey" }));
   };
 
   const saveTavilyKey = () => {
-    setSavingTavilyKey(true);
+    dispatch({ type: "request/started", key: "tavilyKey" });
     api
       .setSettings({ tavily_search_api_key: tavilyKeyInput })
       .then((s) => {
-        apply(s);
-        setTavilyKeyInput("");
+        dispatch({ type: "apiKeySaved", provider: "tavily", settings: s });
         toast.success(t("Saved Tavily API Key"));
       })
       .catch((e) => toast.error(t("Save failed: {error}", { error: (e as Error).message })))
-      .finally(() => setSavingTavilyKey(false));
+      .finally(() => dispatch({ type: "request/finished", key: "tavilyKey" }));
   };
 
   const saveKeenableKey = () => {
-    setSavingKeenableKey(true);
+    dispatch({ type: "request/started", key: "keenableKey" });
     api
       .setSettings({ keenable_search_api_key: keenableKeyInput })
       .then((s) => {
-        apply(s);
-        setKeenableKeyInput("");
+        dispatch({ type: "apiKeySaved", provider: "keenable", settings: s });
         toast.success(t("Saved Keenable API Key"));
       })
       .catch((e) => toast.error(t("Save failed: {error}", { error: (e as Error).message })))
-      .finally(() => setSavingKeenableKey(false));
+      .finally(() => dispatch({ type: "request/finished", key: "keenableKey" }));
   };
 
   const saveProxy = () => {
-    setSavingProxy(true);
+    dispatch({ type: "request/started", key: "proxy" });
     api
       .setSettings({ web_search_proxy: proxyInput.trim() })
       .then((s) => {
@@ -250,11 +235,11 @@ export default function SystemSettingsPage() {
         toast.success(proxyInput.trim() ? t("Saved egress proxy") : t("Cleared egress proxy (direct connection)"));
       })
       .catch((e) => toast.error(t("Save failed: {error}", { error: (e as Error).message })))
-      .finally(() => setSavingProxy(false));
+      .finally(() => dispatch({ type: "request/finished", key: "proxy" }));
   };
 
   const saveGlobalProxy = () => {
-    setSavingGlobalProxy(true);
+    dispatch({ type: "request/started", key: "globalProxy" });
     api
       .setSettings({ global_proxy: globalProxyInput.trim() })
       .then((s) => {
@@ -262,13 +247,13 @@ export default function SystemSettingsPage() {
         toast.success(globalProxyInput.trim() ? t("Saved global proxy") : t("Cleared global proxy (direct connection)"));
       })
       .catch((e) => toast.error(t("Save failed: {error}", { error: (e as Error).message })))
-      .finally(() => setSavingGlobalProxy(false));
+      .finally(() => dispatch({ type: "request/finished", key: "globalProxy" }));
   };
 
   // Run a real "test" search ("test") against the CURRENT form values (backend +
   // proxy + entered key), falling back to saved values server-side. Toasts result.
   const runTest = () => {
-    setTesting(true);
+    dispatch({ type: "request/started", key: "test" });
     api
       .testWebSearch({
         web_search_backend: backend,
@@ -283,7 +268,7 @@ export default function SystemSettingsPage() {
         else toast.error(t("Search test failed: {error}", { error: r.error || t("unknown error") }));
       })
       .catch((e) => toast.error(t("Search test failed: {error}", { error: (e as Error).message })))
-      .finally(() => setTesting(false));
+      .finally(() => dispatch({ type: "request/finished", key: "test" }));
   };
 
   // brave-free selected but no key stored and none being entered → tool stays off.
@@ -411,7 +396,7 @@ export default function SystemSettingsPage() {
                 placeholder={t("socks5://user:pass@host:1080 or http://host:port (empty = direct)")}
                 value={globalProxyInput}
                 disabled={!loaded || savingGlobalProxy}
-                onChange={(e) => setGlobalProxyInput(e.target.value)}
+                onChange={(e) => dispatch({ type: "globalProxyChanged", value: e.target.value })}
               />
               <Button type="button" onClick={saveGlobalProxy} disabled={!loaded || savingGlobalProxy}>
                 {t("Save")}
@@ -534,7 +519,7 @@ export default function SystemSettingsPage() {
                 checked={webSearch}
                 disabled={!loaded || saving}
                 onCheckedChange={(v) => {
-                  setWebSearch(v); // optimistic
+                  dispatch({ type: "webSearchChanged", patch: { enabled: v } }); // optimistic
                   saveWebSearch({ web_search_enabled: v });
                 }}
               />
@@ -547,7 +532,7 @@ export default function SystemSettingsPage() {
                   value={backend}
                   disabled={!loaded || saving}
                   onValueChange={(v) => {
-                    setBackend(v); // optimistic
+                    dispatch({ type: "webSearchChanged", patch: { backend: v } }); // optimistic
                     saveWebSearch({ web_search_backend: v });
                   }}
                 >
@@ -604,7 +589,7 @@ export default function SystemSettingsPage() {
                     placeholder={braveKeySet ? t("Configured (leave empty to keep)") : t("Enter Brave API Key")}
                     value={braveKeyInput}
                     disabled={!loaded || savingKey}
-                    onChange={(e) => setBraveKeyInput(e.target.value)}
+                    onChange={(e) => dispatch({ type: "apiKeyInputChanged", provider: "brave", input: e.target.value })}
                   />
                   <Button
                     type="button"
@@ -639,7 +624,9 @@ export default function SystemSettingsPage() {
                     placeholder={tavilyKeySet ? t("Configured (leave empty to keep)") : t("Enter Tavily API Key (tvly-…)")}
                     value={tavilyKeyInput}
                     disabled={!loaded || savingTavilyKey}
-                    onChange={(e) => setTavilyKeyInput(e.target.value)}
+                    onChange={(e) =>
+                      dispatch({ type: "apiKeyInputChanged", provider: "tavily", input: e.target.value })
+                    }
                   />
                   <Button
                     type="button"
@@ -676,7 +663,9 @@ export default function SystemSettingsPage() {
                     }
                     value={keenableKeyInput}
                     disabled={!loaded || savingKeenableKey}
-                    onChange={(e) => setKeenableKeyInput(e.target.value)}
+                    onChange={(e) =>
+                      dispatch({ type: "apiKeyInputChanged", provider: "keenable", input: e.target.value })
+                    }
                   />
                   <Button
                     type="button"
@@ -708,7 +697,7 @@ export default function SystemSettingsPage() {
                     placeholder={t("http://host:port or socks5://host:port (empty = direct)")}
                     value={proxyInput}
                     disabled={!loaded || savingProxy}
-                    onChange={(e) => setProxyInput(e.target.value)}
+                    onChange={(e) => dispatch({ type: "webSearchChanged", patch: { proxy: e.target.value } })}
                   />
                   <Button type="button" onClick={saveProxy} disabled={!loaded || savingProxy}>
                     {t("Save")}
@@ -762,7 +751,7 @@ export default function SystemSettingsPage() {
                 placeholder={t("/usr/bin/python3 (empty = auto-detect)")}
                 value={pyInterp}
                 disabled={!loaded || saving}
-                onChange={(e) => setPyInterp(e.target.value)}
+                onChange={(e) => dispatch({ type: "runtimeChanged", patch: { pythonInterpreter: e.target.value } })}
               />
               <Button variant="outline" onClick={detectPython} disabled={!loaded || saving}>
                 {t("Re-detect")}
@@ -797,7 +786,7 @@ export default function SystemSettingsPage() {
                 placeholder="3"
                 value={workers}
                 disabled={!loaded || savingWorkers}
-                onChange={(e) => setWorkers(e.target.value)}
+                onChange={(e) => dispatch({ type: "runtimeChanged", patch: { workers: e.target.value } })}
               />
               <Button onClick={saveWorkers} disabled={!loaded || savingWorkers}>
                 {t("Save")}
